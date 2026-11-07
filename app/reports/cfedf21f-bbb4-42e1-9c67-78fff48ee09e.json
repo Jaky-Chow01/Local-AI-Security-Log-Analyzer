@@ -1,0 +1,425 @@
+{
+  "report_version": "1.0",
+  "job_id": "cfedf21f-bbb4-42e1-9c67-78fff48ee09e",
+  "generated_at": "2026-11-07T09:37:19.102890Z",
+  "source": {
+    "filename": "Cultive8_Workspace_Agrigen_Server.log",
+    "total_lines": 298,
+    "chunks": 21,
+    "model": "qwen2.5-3b-q4_k_m"
+  },
+  "status": "complete",
+  "summary": {
+    "overall_risk": "critical",
+    "counts_by_severity": {
+      "critical": 3,
+      "high": 2,
+      "medium": 11,
+      "low": 0
+    },
+    "executive_summary": "Analyzed 298 lines across 21 chunks. Identified 16 distinct security findings and 2 multi-stage incident chains. Overall assessed risk level is CRITICAL."
+  },
+  "incidents": [
+    {
+      "title": "Multi-vector attack campaign from 203.0.113.90",
+      "identifier": "203.0.113.90",
+      "severity": "high",
+      "timeline": [
+        {
+          "line": 58,
+          "event": "Reconnaissance or vulnerability scanning probe detected targeting /wp-admin/."
+        },
+        {
+          "line": 60,
+          "event": "Reconnaissance or vulnerability scanning probe detected targeting /wp-admin/."
+        },
+        {
+          "line": 62,
+          "event": "Reconnaissance or vulnerability scanning probe detected targeting /wp-admin/."
+        },
+        {
+          "line": 69,
+          "event": "Reconnaissance or vulnerability scanning probe detected targeting /wp-admin/."
+        },
+        {
+          "line": 99,
+          "event": "Path traversal sequence detected in request path: /api/v1/files?name=..%2F..%2Fetc%2Fpasswd"
+        },
+        {
+          "line": 101,
+          "event": "Path traversal sequence detected in request path: /api/v1/files?name=..%2F..%2Fetc%2Fpasswd"
+        }
+      ],
+      "finding_ids": [
+        "DET-RECON-58",
+        "DET-TRAV-99"
+      ]
+    },
+    {
+      "title": "Account takeover with data exfiltration (203.0.113.44)",
+      "identifier": "203.0.113.44",
+      "severity": "critical",
+      "timeline": [
+        {
+          "line": 5,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 13,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 23,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 35,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 50,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 65,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 80,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 94,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 108,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 123,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 153,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 189,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 196,
+          "event": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts."
+        },
+        {
+          "line": 201,
+          "event": "Abnormally large data transfer (2.71 MB) on export endpoint /api/v1/workspaces/7/export?format=csv."
+        }
+      ],
+      "finding_ids": [
+        "DET-ATO-196",
+        "DET-EXFIL-201"
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "DET-SQLI-29",
+      "attack_type": "sql_injection",
+      "severity": "high",
+      "identifier": "203.0.113.72",
+      "evidence_lines": [
+        29,
+        30,
+        32,
+        222,
+        223
+      ],
+      "reasoning": "Detected SQL injection signature in path/parameters from IP 203.0.113.72.",
+      "suggested_actions": [
+        "Block IP address",
+        "Inspect database logs for unauthorized queries"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-51",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.99",
+      "evidence_lines": [
+        51
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/profile.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-58",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "203.0.113.90",
+      "evidence_lines": [
+        58,
+        60,
+        62,
+        69
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /wp-admin/.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-TRAV-99",
+      "attack_type": "path_traversal",
+      "severity": "high",
+      "identifier": "203.0.113.90",
+      "evidence_lines": [
+        99,
+        101
+      ],
+      "reasoning": "Path traversal sequence detected in request path: /api/v1/files?name=..%2F..%2Fetc%2Fpasswd",
+      "suggested_actions": [
+        "Block IP address",
+        "Review web server access permissions"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-104",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.98",
+      "evidence_lines": [
+        104
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/weather.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-110",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.114",
+      "evidence_lines": [
+        110
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/dashboard.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-114",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.110",
+      "evidence_lines": [
+        114
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/profile.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RATE-159",
+      "attack_type": "rate_abuse",
+      "severity": "medium",
+      "identifier": "203.0.113.155",
+      "evidence_lines": [
+        159,
+        160,
+        161,
+        162,
+        163,
+        164,
+        165,
+        166,
+        167,
+        168,
+        169,
+        170
+      ],
+      "reasoning": "Rate limit threshold exceeded or excessive request frequency from IP 203.0.113.155.",
+      "suggested_actions": [
+        "Enable rate-limiting middleware",
+        "Apply IP throttling"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-174",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.95",
+      "evidence_lines": [
+        174
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/workspaces/7/tasks.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-184",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.101",
+      "evidence_lines": [
+        184
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/workspaces/7/tasks.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-ATO-196",
+      "attack_type": "account_takeover",
+      "severity": "critical",
+      "identifier": "203.0.113.44",
+      "evidence_lines": [
+        5,
+        13,
+        23,
+        35,
+        50,
+        65,
+        80,
+        94,
+        108,
+        123,
+        153,
+        189,
+        196
+      ],
+      "reasoning": "Account takeover suspected: successful login for user 'workspace.admin' from IP 203.0.113.44 after 13 failed attempts.",
+      "suggested_actions": [
+        "Revoke active session tokens",
+        "Force password reset for user",
+        "Block IP"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-EXFIL-201",
+      "attack_type": "data_exfiltration",
+      "severity": "critical",
+      "identifier": "203.0.113.44",
+      "evidence_lines": [
+        201
+      ],
+      "reasoning": "Abnormally large data transfer (2.71 MB) on export endpoint /api/v1/workspaces/7/export?format=csv.",
+      "suggested_actions": [
+        "Audit exported dataset",
+        "Restrict export privileges for authenticated role"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-216",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.84",
+      "evidence_lines": [
+        216
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/fields?farm_id=18.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-PINJ-217",
+      "attack_type": "prompt_injection",
+      "severity": "critical",
+      "identifier": "203.0.113.201",
+      "evidence_lines": [
+        217
+      ],
+      "reasoning": "Adversarial prompt injection payload detected in user input field at line 217.",
+      "suggested_actions": [
+        "Sanitize input fields",
+        "Discard model instructions contained within log payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-228",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.82",
+      "evidence_lines": [
+        228
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/profile.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-RECON-247",
+      "attack_type": "recon_scanning",
+      "severity": "medium",
+      "identifier": "198.51.100.104",
+      "evidence_lines": [
+        247
+      ],
+      "reasoning": "Reconnaissance or vulnerability scanning probe detected targeting /api/v1/crops.",
+      "suggested_actions": [
+        "Rate limit IP",
+        "Monitor for subsequent exploit payloads"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    }
+  ],
+  "coverage": {
+    "failed_ranges": [],
+    "truncated_lines": [],
+    "rejected_model_findings": 0
+  },
+  "limitations": [
+    "Analysis performed offline with 2 vCPU budget constraints.",
+    "Heuristic thresholds tuned for standard web server access and audit logs."
+  ]
+}

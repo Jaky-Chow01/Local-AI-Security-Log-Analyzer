@@ -18,8 +18,14 @@ app = FastAPI(
 )
 
 # Initialize database and schema on startup
+from fastapi import FastAPI
+from app.db import init_db
+
+app = FastAPI(title="Local AI Security Log Analyzer")
+
 @app.on_event("startup")
-on_startup = lambda: init_db()
+def startup_event():
+    init_db()
 
 # Mount static frontend directory
 STATIC_DIR = Path("static")
