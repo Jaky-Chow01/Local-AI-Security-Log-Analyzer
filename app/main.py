@@ -7,9 +7,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.db import get_job_line, get_job_status, init_db, save_job_record
-from app.validate import validate_upload_file, ValidationError
-from app.chunker import chunk_log_file
-from app.llm import get_tokenizer_fn
+from app.validate import ValidationError, save_upload_stream
 from app.queue import JobQueueManager
 from app.report import generate_json_report
 
@@ -50,28 +48,13 @@ async def upload_log_file(file: UploadFile = File(...)):
     and line limits, chunks the file, and enqueues it for background processing.
     """
     job_id = str(uuid.uuid4())
-    safe_filename = f"{job_id}_{Path(file.filename).name}"
+    filename = file.filename or ""
+    safe_filename = f"{job_id}_{Path(filename).name}"
     file_path = UPLOADS_DIR / safe_filename
 
     try:
-        # Stream upload to disk
-        with open(file_path, "wb") as buffer:
-            while chunk := await file.read(1024 * 1024):
-                buffer.write(chunk)
-
-        # Validate upload
-        validate_upload_file(file_path, file.filename)
-
-        # Tokenize and chunk log file
-        tokenizer_fn = get_tokenizer_fn()
-        chunks = chunk_log_file(str(file_path), tokenizer_fn, max_tokens_per_chunk=1000)
-
-        # Count total lines across chunks
-        with open(file_path, "r", encoding="utf-8", errors="replace") as log_file:
-            total_lines = sum(1 for _ in log_file)
-
-        # Save job and chunks to SQLite
-        save_job_record(job_id, file.filename, total_lines, chunks)
+        total_lines = await save_upload_stream(file, file_path, filename)
+        save_job_record(job_id, Path(filename).name, total_lines, [])
 
         # Enqueue job for background processing
         queue_manager = JobQueueManager.get_instance()
@@ -79,9 +62,9 @@ async def upload_log_file(file: UploadFile = File(...)):
 
         return JSONResponse(status_code=202, content={
             "job_id": job_id,
-            "filename": file.filename,
+            "filename": Path(filename).name,
             "total_lines": total_lines,
-            "total_chunks": len(chunks),
+            "total_chunks": 0,
             "status": "queued"
         })
 

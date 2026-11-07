@@ -19,7 +19,6 @@ def download_and_verify_model():
         repo_id=MODEL_REPO,
         filename=MODEL_FILENAME,
         local_dir=str(MODELS_DIR),
-        local_dir_use_symlinks=False
     )
 
     print(f"[+] Model downloaded successfully to: {downloaded_path}")
@@ -35,8 +34,9 @@ def download_and_verify_model():
     with open(SHA_PATH, "w", encoding="utf-8") as f:
         f.write(f"{digest}  {MODEL_FILENAME}\n")
 
-    print(f"[+] Checksum verified and saved to {SHA_PATH}")
+    print(f"[+] Locally computed SHA-256 saved to {SHA_PATH}")
     print(f"    SHA-256: {digest}")
+    print("    This records the downloaded file's digest; it does not authenticate the publisher.")
 
 if __name__ == "__main__":
     download_and_verify_model()

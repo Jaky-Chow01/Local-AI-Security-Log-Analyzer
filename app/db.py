@@ -90,7 +90,7 @@ def init_db() -> None:
         conn.execute("""
             UPDATE chunks 
             SET status = 'pending' 
-            WHERE status = 'running';
+            WHERE status IN ('running', 'retrying');
         """)
         conn.execute("""
             UPDATE jobs
@@ -123,6 +123,38 @@ def save_job_record(job_id: str, filename: str, total_lines: int, chunks: List[D
                     json.dumps(chunk["lines"])
                 )
             )
+        conn.commit()
+
+
+def save_job_chunks(job_id: str, chunks: List[Dict[str, Any]]) -> None:
+    """Persists background-created chunks and publishes their count atomically."""
+    with get_db_connection() as conn:
+        for idx, chunk in enumerate(chunks):
+            conn.execute(
+                """
+                INSERT INTO chunks
+                (chunk_id, job_id, chunk_index, start_line, end_line, token_count,
+                 status, compacted_data)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?);
+                """,
+                (
+                    chunk["chunk_id"],
+                    job_id,
+                    idx,
+                    chunk["start_line"],
+                    chunk["end_line"],
+                    chunk["token_count"],
+                    json.dumps(chunk["lines"]),
+                ),
+            )
+        conn.execute(
+            """
+            UPDATE jobs
+            SET total_chunks = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = ?;
+            """,
+            (len(chunks), job_id),
+        )
         conn.commit()
 
 def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:

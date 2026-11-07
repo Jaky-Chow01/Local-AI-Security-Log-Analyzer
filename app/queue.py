@@ -6,12 +6,23 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.db import get_db_connection
+from app.chunker import chunk_log_file
+from app.db import get_db_connection, save_job_chunks
 from app.detectors import run_deterministic_detectors
-from app.llm import LLMManager
+from app.llm import (
+    InferenceTimeoutError,
+    LLMManager,
+    MAX_INFERENCE_TOKENS,
+    ModelBusyError,
+    get_tokenizer_fn,
+    get_inference_timeout_seconds,
+    get_model_context_size,
+)
 from app.prompts import LOG_CLASSIFICATION_SCHEMA
 
 logger = logging.getLogger(__name__)
+MAX_TOKENS_PER_CHUNK = 1000
+MODEL_PROMPT_RESERVE_TOKENS = 600
 
 
 class JobQueueManager:
@@ -43,16 +54,20 @@ class JobQueueManager:
             rows = conn.execute(
                 """
                 SELECT j.job_id, j.filename, j.model_name, j.model_status,
+                    j.status, j.total_chunks,
                     SUM(CASE WHEN c.status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
                     SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END) AS failed_count
                 FROM jobs AS j
                 LEFT JOIN chunks AS c ON c.job_id = j.job_id
-                WHERE j.status = 'partial'
+                WHERE j.status IN ('queued', 'partial')
                 GROUP BY j.job_id
                 """
             ).fetchall()
         for row in rows:
-            if not row["pending_count"]:
+            filename = Path(row["filename"]).name
+            file_path = Path("uploads") / f"{row['job_id']}_{filename}"
+            needs_chunking = row["total_chunks"] == 0
+            if not row["pending_count"] and not needs_chunking:
                 recovered_status = "partial" if row["failed_count"] else "complete"
                 recovered_model_status = row["model_status"]
                 if recovered_model_status == "interrupted":
@@ -70,9 +85,7 @@ class JobQueueManager:
                     conn.commit()
                 continue
 
-            filename = Path(row["filename"]).name
-            file_path = Path("uploads") / f"{row['job_id']}_{filename}"
-            if file_path.exists():
+            if file_path.exists() or row["total_chunks"] > 0:
                 self.enqueue_job(row["job_id"], str(file_path))
             else:
                 logger.error(
@@ -80,6 +93,15 @@ class JobQueueManager:
                     row["job_id"],
                     file_path,
                 )
+                with get_db_connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE jobs SET status = 'failed',
+                            updated_at = CURRENT_TIMESTAMP WHERE job_id = ?;
+                        """,
+                        (row["job_id"],),
+                    )
+                    conn.commit()
 
     def cancel_job(self, job_id: str) -> None:
         """Triggers cooperative cancellation for a running job."""
@@ -91,12 +113,12 @@ class JobQueueManager:
         """Single-flight background worker thread loop."""
         while True:
             try:
-                job_id, _ = self.job_queue.get(timeout=1.0)
+                job_id, file_path = self.job_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
             try:
-                self._process_job(job_id)
+                self._process_job(job_id, file_path)
             except Exception:
                 logger.exception("Unexpected failure processing job %s", job_id)
                 with get_db_connection() as conn:
@@ -109,16 +131,13 @@ class JobQueueManager:
                 self.job_queue.task_done()
                 self.cancel_flags.pop(job_id, None)
 
-    def _process_job(self, job_id: str) -> None:
+    def _process_job(self, job_id: str, file_path: Optional[str] = None) -> None:
         """Runs deterministic detection and model analysis, preserving partial work."""
         cancel_event = self.cancel_flags.get(job_id)
 
         with get_db_connection() as conn:
             conn.execute(
-                """
-                UPDATE jobs SET status = ?, model_status = 'loading',
-                    updated_at = CURRENT_TIMESTAMP WHERE job_id = ?;
-                """,
+                "UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE job_id = ?;",
                 ("running", job_id),
             )
             conn.commit()
@@ -126,6 +145,25 @@ class JobQueueManager:
                 "SELECT * FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC;",
                 (job_id,),
             ).fetchall()
+
+        if not all_chunk_rows and file_path is not None:
+            chunks = chunk_log_file(
+                file_path,
+                get_tokenizer_fn(),
+                max_tokens_per_chunk=min(
+                    MAX_TOKENS_PER_CHUNK,
+                    min(get_model_context_size(), MAX_INFERENCE_TOKENS)
+                    - MODEL_PROMPT_RESERVE_TOKENS,
+                ),
+            )
+            save_job_chunks(job_id, chunks)
+            with get_db_connection() as conn:
+                all_chunk_rows = conn.execute(
+                    "SELECT * FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC;",
+                    (job_id,),
+                ).fetchall()
+
+        with get_db_connection() as conn:
             pending_chunk_rows = [
                 row for row in all_chunk_rows if row["status"] == "pending"
             ]
@@ -134,34 +172,49 @@ class JobQueueManager:
                 all_lines.extend(json.loads(row["compacted_data"]))
 
         deterministic_findings = run_deterministic_detectors(all_lines)
-        with get_db_connection() as conn:
-            for finding in deterministic_findings:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO findings
-                    (id, job_id, attack_type, severity, identifier, evidence_lines,
-                     reasoning, suggested_actions, confidence, source)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                    """,
-                    (
-                        finding["id"],
-                        job_id,
-                        finding["attack_type"],
-                        finding["severity"],
-                        finding["identifier"],
-                        json.dumps(finding["evidence_lines"]),
-                        finding["reasoning"],
-                        json.dumps(finding["suggested_actions"]),
-                        1.0,
-                        finding["source"],
-                    ),
-                )
-            conn.commit()
+        self._persist_deterministic_findings(job_id, deterministic_findings)
 
         if pending_chunk_rows:
             self._rebuild_ledger(
                 job_id, through_line=pending_chunk_rows[0]["start_line"] - 1
             )
+        elif not all_chunk_rows:
+            with get_db_connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs SET status = 'failed', model_status = 'unavailable',
+                        updated_at = CURRENT_TIMESTAMP WHERE job_id = ?;
+                    """,
+                    (job_id,),
+                )
+                conn.commit()
+            return
+        elif not any(row["status"] in {"running", "retrying"} for row in all_chunk_rows):
+            final_status = (
+                "partial"
+                if any(row["status"] == "failed" for row in all_chunk_rows)
+                else "complete"
+            )
+            with get_db_connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs SET status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE job_id = ?;
+                    """,
+                    (final_status, job_id),
+                )
+                conn.commit()
+            return
+
+        with get_db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE jobs SET model_status = 'loading',
+                    updated_at = CURRENT_TIMESTAMP WHERE job_id = ?;
+                """,
+                (job_id,),
+            )
+            conn.commit()
 
         try:
             llm_manager = LLMManager.get_instance()
@@ -271,6 +324,9 @@ class JobQueueManager:
         lines: List[Dict[str, Any]],
         cancel_event: Optional[threading.Event],
     ) -> Tuple[List[Dict[str, Any]], bool]:
+        inference_timeout = get_inference_timeout_seconds()
+        tokenize = getattr(manager, "tokenize", None)
+
         def classify_segment(segment: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             compact_text = "\n".join(line["compacted"] for line in segment)
             last_error: Optional[Exception] = None
@@ -291,8 +347,12 @@ class JobQueueManager:
                         time.sleep(float(attempt))
                 try:
                     return manager.classify_chunk(
-                        self._get_ledger_summary(job_id), compact_text
+                        self._get_ledger_summary(job_id, tokenize),
+                        compact_text,
+                        timeout=inference_timeout,
                     ).get("findings", [])
+                except (InferenceTimeoutError, ModelBusyError):
+                    raise
                 except Exception as exc:
                     last_error = exc
                     logger.warning(
@@ -307,6 +367,9 @@ class JobQueueManager:
             return classify_segment(lines), True
         except InterruptedError:
             return [], False
+        except (InferenceTimeoutError, ModelBusyError) as exc:
+            logger.error("Model analysis stopped for chunk %s: %s", chunk_id, exc)
+            return [], False
         except Exception as first_error:
             if len(lines) < 2:
                 logger.error("Chunk %s failed model analysis: %s", chunk_id, first_error)
@@ -318,6 +381,10 @@ class JobQueueManager:
             for segment in (lines[:midpoint], lines[midpoint:]):
                 try:
                     partial_findings.extend(classify_segment(segment))
+                except (InferenceTimeoutError, ModelBusyError) as exc:
+                    logger.error("Split retry stopped for chunk %s: %s", chunk_id, exc)
+                    split_complete = False
+                    break
                 except InterruptedError:
                     split_complete = False
                     break
@@ -389,7 +456,7 @@ class JobQueueManager:
 
         with get_db_connection() as conn:
             for index, finding in enumerate(accepted):
-                finding_id = f"LLM-{chunk_id[:8]}-{index}"
+                finding_id = f"{job_id}:LLM-{chunk_id[:8]}-{index}"
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO findings
@@ -413,8 +480,37 @@ class JobQueueManager:
             conn.commit()
         return rejected_count
 
-    def _get_ledger_summary(self, job_id: str) -> str:
-        """Returns suspicious entities with attack and authentication context."""
+    def _persist_deterministic_findings(
+        self, job_id: str, findings: List[Dict[str, Any]]
+    ) -> None:
+        with get_db_connection() as conn:
+            for finding in findings:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO findings
+                    (id, job_id, attack_type, severity, identifier, evidence_lines,
+                     reasoning, suggested_actions, confidence, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        f"{job_id}:{finding['id']}",
+                        job_id,
+                        finding["attack_type"],
+                        finding["severity"],
+                        finding["identifier"],
+                        json.dumps(finding["evidence_lines"]),
+                        finding["reasoning"],
+                        json.dumps(finding["suggested_actions"]),
+                        1.0,
+                        finding["source"],
+                    ),
+                )
+            conn.commit()
+
+    def _get_ledger_summary(
+        self, job_id: str, tokenize: Optional[Any] = None, max_tokens: int = 200
+    ) -> str:
+        """Returns a tokenizer-bounded summary of recent suspicious entities."""
         with get_db_connection() as conn:
             rows = conn.execute(
                 """
@@ -422,14 +518,26 @@ class JobQueueManager:
                 FROM ledger
                 WHERE job_id = ? AND suspicion_score > 0
                 ORDER BY suspicion_score DESC, last_updated_line DESC
-                LIMIT 8;
+                LIMIT 5;
                 """,
                 (job_id,),
             ).fetchall()
-        return "\n".join(
-            f"- {row['entity_key']} (score {row['suspicion_score']:.1f}): {row['summary_text']}"
+        entries = [
+            f"- {row['entity_key'][:64]} (score {row['suspicion_score']:.1f}): "
+            f"{row['summary_text'][:240]}"
             for row in rows
-        )
+        ]
+        while entries:
+            summary = "\n".join(entries)
+            token_count = (
+                len(tokenize(summary))
+                if tokenize is not None
+                else len(summary.encode("utf-8"))
+            )
+            if token_count <= max_tokens:
+                return summary
+            entries.pop()
+        return ""
 
     def _rebuild_ledger(
         self, job_id: str, through_line: Optional[int] = None
@@ -491,6 +599,11 @@ class JobQueueManager:
             severity_scores = {"low": 1.0, "medium": 2.0, "high": 3.0, "critical": 4.0}
             for row in finding_rows:
                 identifier = row["identifier"]
+                evidence_lines = json.loads(row["evidence_lines"])
+                if through_line is not None and (
+                    not evidence_lines or max(evidence_lines) > through_line
+                ):
+                    continue
                 entity = entities.setdefault(
                     identifier,
                     {
@@ -502,12 +615,15 @@ class JobQueueManager:
                     },
                 )
                 entity["findings"].append(row["attack_type"])
-                evidence_lines = json.loads(row["evidence_lines"])
-                if through_line is not None and (
-                    not evidence_lines or max(evidence_lines) > through_line
-                ):
-                    continue
-                entity["evidence_lines"].extend(evidence_lines)
+                for evidence_line in evidence_lines:
+                    sampled_lines = sorted(
+                        set(entity["evidence_lines"]) | {evidence_line}
+                    )
+                    entity["evidence_lines"] = (
+                        sampled_lines
+                        if len(sampled_lines) <= 4
+                        else sampled_lines[:2] + sampled_lines[-2:]
+                    )
                 if evidence_lines:
                     entity["last_line"] = max(entity["last_line"], max(evidence_lines))
                 entity["score"] = entity.get("score", 0.0) + severity_scores.get(
@@ -522,11 +638,19 @@ class JobQueueManager:
                 if score <= 0 and entity["login_failures"] == 0:
                     continue
                 attack_types = sorted(set(entity["findings"]))
+                evidence = sorted(set(entity["evidence_lines"]))
+                if len(evidence) > 4:
+                    evidence_summary = (
+                        f"{','.join(map(str, evidence[:2]))},...,"
+                        f"{','.join(map(str, evidence[-2:]))}"
+                    )
+                else:
+                    evidence_summary = ",".join(map(str, evidence))
                 summary = (
-                    f"requests={entity['requests']}; "
-                    f"login_failures={entity['login_failures']}; "
-                    f"findings={','.join(attack_types) or 'none'}; "
-                    f"evidence_lines={','.join(map(str, sorted(set(entity['evidence_lines'])))) or 'none'}"
+                    f"req={entity['requests']}; "
+                    f"fails={entity['login_failures']}; "
+                    f"attacks={','.join(attack_types[:3]) or 'none'}; "
+                    f"lines={evidence_summary or 'none'}"
                 )
                 conn.execute(
                     """

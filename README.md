@@ -21,10 +21,12 @@ python -m pip install -r requirements.txt
 python scripts/download_model.py
 ```
 
-The model download is a setup-time network operation. Check the downloaded
-model against the published checksum with `scripts/verify_offline.sh` in an
-environment that provides a compatible shell. After setup, the analyzer runs
-without a cloud connection.
+The model download is a setup-time network operation. `download_model.py`
+computes a local SHA-256 after downloading; this detects later file changes but
+does not authenticate the publisher or the original download. Run
+`scripts/verify_offline.sh` in an environment that provides a compatible shell
+to check the file against that locally saved digest. After setup, the analyzer
+runs without a cloud connection.
 
 To select another local GGUF file, set `MODEL_PATH` before starting the server.
 If the model is missing or cannot load, deterministic detectors still analyze
@@ -61,14 +63,26 @@ stored in `app/db.sqlite`.
 
 ## Benchmark
 
-Run the benchmark after downloading the model:
+Each model call is capped at 2,048 total tokens, including the prompt, ledger,
+and up to 400 generated tokens. Log chunks target at most 1,000 tokens to leave
+room for prompt instructions and entity context; the model call measures the
+formatted prompt with the real tokenizer and rejects/splits any call that would
+exceed the cap. The default model context is also 2,048 tokens.
+
+Run the representative benchmark after downloading the model:
 
 ```powershell
-python scripts/benchmark.py
+python scripts/benchmark.py --chunk-tokens 1000 --context-size 2048
 ```
 
-It reports native process RSS, inference speed, and whether peak RSS remained
-within 4 GiB. To enforce both the memory and CPU budget, run it inside a
+It builds the real classification prompt and schema-constrained inference,
+reports input/output time and native process RSS, and checks whether peak RSS
+remained within 4 GiB. The default timeout is 120 seconds and can be overridden
+with `LLM_TIMEOUT_SECONDS`. A timeout cannot cancel llama.cpp while it is
+evaluating a prompt; a later chunk waits for the active inference lock, up to its
+own timeout, before beginning model execution.
+
+To measure the target 2-vCPU/4-GiB configuration, run the benchmark inside a
 container image that has this repository's Python dependencies installed and
 the model mounted:
 
@@ -76,12 +90,15 @@ the model mounted:
 docker run --rm --memory=4g --cpus=2 \
   -v "$PWD:/workspace" -w /workspace \
   local-ai-security-log-analyzer:latest \
-  python scripts/benchmark.py
+  python scripts/benchmark.py --chunk-tokens 1000 --context-size 2048
 ```
 
 The repository does not include a container image; `local-ai-security-log-analyzer:latest`
-is an example image name. A benchmark result only applies to the hardware,
-runtime, model, and container limits used for that run.
+is an example image name. A successful benchmark has not yet been recorded
+because the GGUF model is not included. Set `LLM_TIMEOUT_SECONDS` based on a
+benchmark on the deployment hardware; 120 seconds is a conservative default,
+not a certified runtime. A benchmark result only applies to the hardware,
+runtime, model, prompt size, and container limits used for that run.
 
 ## Tests
 

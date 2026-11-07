@@ -20,7 +20,47 @@ class ModelExecutionError(Exception):
     """Raised when the LLM fails to process a chunk."""
 
 
+class InferenceTimeoutError(ModelExecutionError):
+    """Raised when inference exceeds its caller deadline."""
+
+
+class ModelBusyError(ModelExecutionError):
+    """Raised when an earlier inference still owns the model."""
+
+
 _INFERENCE_LOCK = threading.Lock()
+DEFAULT_INFERENCE_TIMEOUT_SECONDS = 120
+DEFAULT_MODEL_CONTEXT_SIZE = 2048
+MAX_INFERENCE_TOKENS = 2048
+MAX_OUTPUT_TOKENS = 400
+
+
+def get_inference_timeout_seconds() -> int:
+    """Reads the configured inference deadline, defaulting to a conservative 120 seconds."""
+    raw_timeout = os.getenv("LLM_TIMEOUT_SECONDS")
+    if raw_timeout is None:
+        return DEFAULT_INFERENCE_TIMEOUT_SECONDS
+    try:
+        timeout = int(raw_timeout)
+    except ValueError as exc:
+        raise ValueError("LLM_TIMEOUT_SECONDS must be a positive integer.") from exc
+    if timeout <= 0:
+        raise ValueError("LLM_TIMEOUT_SECONDS must be a positive integer.")
+    return timeout
+
+
+def get_model_context_size() -> int:
+    """Reads the model context size from the environment."""
+    raw_context = os.getenv("MODEL_CONTEXT_SIZE")
+    if raw_context is None:
+        return DEFAULT_MODEL_CONTEXT_SIZE
+    try:
+        context_size = int(raw_context)
+    except ValueError as exc:
+        raise ValueError("MODEL_CONTEXT_SIZE must be a positive integer.") from exc
+    if context_size < 1024:
+        raise ValueError("MODEL_CONTEXT_SIZE must be at least 1024.")
+    return context_size
 
 
 class LLMManager:
@@ -30,7 +70,7 @@ class LLMManager:
     def __init__(
         self,
         model_path: str = "models/qwen2.5-3b-instruct-q4_k_m.gguf",
-        n_ctx: int = 2048,
+        n_ctx: int = DEFAULT_MODEL_CONTEXT_SIZE,
     ):
         self.model_path = model_path
         self.n_ctx = n_ctx
@@ -39,13 +79,18 @@ class LLMManager:
         self._load_model()
 
     @classmethod
-    def get_instance(cls, model_path: Optional[str] = None) -> "LLMManager":
+    def get_instance(
+        cls, model_path: Optional[str] = None, n_ctx: Optional[int] = None
+    ) -> "LLMManager":
         with cls._lock:
             if cls._instance is None:
                 path = model_path or os.getenv(
                     "MODEL_PATH", "models/qwen2.5-3b-instruct-q4_k_m.gguf"
                 )
-                cls._instance = cls(model_path=path)
+                cls._instance = cls(
+                    model_path=path,
+                    n_ctx=n_ctx if n_ctx is not None else get_model_context_size(),
+                )
             return cls._instance
 
     def _load_model(self) -> None:
@@ -76,7 +121,7 @@ class LLMManager:
         self,
         ledger_summary: str,
         compact_lines: str,
-        timeout: int = 30,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Classifies one chunk using schema-constrained, time-bounded inference."""
         model = self.model
@@ -90,16 +135,24 @@ class LLMManager:
             f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
+        prompt_tokens = len(model.tokenize(prompt.encode("utf-8"), add_bos=False))
+        token_limit = min(self.n_ctx, MAX_INFERENCE_TOKENS)
+        if prompt_tokens + MAX_OUTPUT_TOKENS > token_limit:
+            raise ModelExecutionError(
+                f"LLM call requires {prompt_tokens} prompt tokens plus "
+                f"{MAX_OUTPUT_TOKENS} output tokens, exceeding the "
+                f"{token_limit}-token limit."
+            )
         response = _run_inference(
             lambda stopping_criteria: model(
                 prompt,
-                max_tokens=400,
+                max_tokens=MAX_OUTPUT_TOKENS,
                 temperature=0.0,
                 echo=False,
                 grammar=grammar,
                 stopping_criteria=stopping_criteria,
             ),
-            timeout,
+            timeout if timeout is not None else get_inference_timeout_seconds(),
         )
         try:
             result = json.loads(response["choices"][0]["text"].strip())
@@ -111,7 +164,7 @@ class LLMManager:
 
 
 def _run_inference(
-    invoke: Callable[[StoppingCriteriaList], Any], timeout: int
+    invoke: Callable[[StoppingCriteriaList], Any], timeout: float
 ) -> Any:
     if timeout <= 0:
         raise ValueError("timeout must be greater than zero")
@@ -125,14 +178,32 @@ def _run_inference(
         return time.monotonic() >= deadline
 
     def run() -> None:
-        acquired = _INFERENCE_LOCK.acquire(blocking=False)
+        remaining = max(0.0, deadline - time.monotonic())
+        acquired = _INFERENCE_LOCK.acquire(timeout=remaining)
         if not acquired:
             result_queue.put(
-                (False, ModelExecutionError("Previous model inference has not stopped."))
+                (
+                    False,
+                    InferenceTimeoutError(
+                        f"Timed out waiting for the active model inference after "
+                        f"{timeout} seconds."
+                    ),
+                )
             )
             finished.set()
             return
         try:
+            if time.monotonic() >= deadline:
+                result_queue.put(
+                    (
+                        False,
+                        InferenceTimeoutError(
+                            f"Timed out waiting for the active model inference after "
+                            f"{timeout} seconds."
+                        ),
+                    )
+                )
+                return
             response = invoke(StoppingCriteriaList([has_timed_out]))
             if time.monotonic() >= deadline:
                 raise ModelExecutionError(f"LLM inference timed out after {timeout} seconds.")
@@ -145,7 +216,10 @@ def _run_inference(
 
     threading.Thread(target=run, daemon=True).start()
     if not finished.wait(timeout):
-        raise ModelExecutionError(f"LLM inference timed out after {timeout} seconds.")
+        raise InferenceTimeoutError(
+            f"LLM inference exceeded {timeout} seconds. "
+            "The llama.cpp call may continue until prompt evaluation or generation returns."
+        )
 
     succeeded, result = result_queue.get_nowait()
     if not succeeded:
@@ -153,31 +227,6 @@ def _run_inference(
             raise result
         raise ModelExecutionError(f"LLM execution failed: {result}") from result
     return result
-
-
-def classify_chunk(llm_instance: Llama, prompt: str, timeout: int = 30) -> Dict[str, Any]:
-    """Runs a raw completion with a hard caller timeout and validates its JSON."""
-    if llm_instance is None:
-        raise ModelExecutionError("LLM instance is uninitialized or unavailable.")
-
-    response = _run_inference(
-        lambda stopping_criteria: llm_instance(
-            prompt,
-            max_tokens=512,
-            temperature=0.0,
-            stop=["</ANALYSIS>"],
-            echo=False,
-            stopping_criteria=stopping_criteria,
-        ),
-        timeout,
-    )
-    try:
-        parsed_data = json.loads(response["choices"][0]["text"].strip())
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        raise ModelExecutionError(f"Model output failed JSON parsing: {exc}") from exc
-    if not isinstance(parsed_data, dict) or not isinstance(parsed_data.get("findings"), list):
-        raise ModelExecutionError("Model output does not match the findings schema.")
-    return parsed_data
 
 
 def get_tokenizer_fn() -> Callable[[str], List[int]]:

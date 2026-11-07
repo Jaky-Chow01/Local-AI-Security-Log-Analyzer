@@ -12,6 +12,7 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
 
     login_failures: Dict[str, List[int]] = {}  # key: ip_or_user -> list of line numbers
     brute_force_reported = set()
+    suspected_takeovers: Dict[str, List[int]] = {}
 
     expanded_entries = []
     seen_line_numbers = set()
@@ -156,6 +157,7 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
             elif status.startswith("2") or auth_result in {"success", "200"}:
                 failures = login_failures.get(key, [])
                 if len(failures) >= 3:
+                    suspected_takeovers[client_ip] = failures + [line_no]
                     findings.append({
                         "id": f"DET-ATO-{line_no}",
                         "attack_type": "account_takeover",
@@ -166,6 +168,32 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
                         "suggested_actions": ["Revoke active session tokens", "Force password reset for user", "Block IP"],
                         "source": "detector"
                     })
+
+        privileged_path = any(
+            segment in decoded_path.lower()
+            for segment in ("/admin", "/manage", "/privileged")
+        )
+        if (
+            privileged_path
+            and status.startswith("2")
+            and client_ip in suspected_takeovers
+        ):
+            findings.append({
+                "id": f"DET-UNAUTH-PRIV-{line_no}",
+                "attack_type": "unauthorized_access",
+                "severity": "critical",
+                "identifier": client_ip,
+                "evidence_lines": [*suspected_takeovers[client_ip], line_no],
+                "reasoning": (
+                    f"Successful privileged access to {path} followed suspicious "
+                    f"login activity from IP {client_ip}."
+                ),
+                "suggested_actions": [
+                    "Revoke the suspicious session and verify the user's identity",
+                    "Audit administrative changes and accessed records",
+                ],
+                "source": "detector"
+            })
 
         # 6. Unauthorized access detector for protected endpoints outside login flows.
         if (
