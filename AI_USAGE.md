@@ -43,6 +43,14 @@ to an incident.
    generated output also use tokens. Chunks now target at most 1,000 tokens,
    and the real formatted prompt plus output allowance is checked against the
    2,048-token call limit before inference.
+6. **Chunking retained redundant copies of the input.** Parsing, deduplication,
+   and packing previously materialized separate full-file lists. The worker now
+   consumes a line-to-chunk iterator and persists each bounded chunk as it is
+   produced; the upload-size and line-count limits remain in force.
+7. **Malformed model output could obscure analysis coverage.** The classifier
+   now extracts a schema-shaped JSON object from harmless wrappers, while
+   malformed output continues through bounded retry/split handling and is
+   recorded as incomplete coverage rather than an empty success.
 
 ## Tools used
 
@@ -55,6 +63,9 @@ to an incident.
 - A local GGUF model is required for end-to-end inference and performance
   benchmarking; that model was not present during the code changes, so no
   successful real-model run is claimed.
+- The dashboard memory value is process RSS, not whole-host usage. Staying below
+  4 GiB must be measured and enforced by the deployment environment; the
+  application cannot guarantee that ceiling across arbitrary hosts.
 
 ## Key coding prompts
 

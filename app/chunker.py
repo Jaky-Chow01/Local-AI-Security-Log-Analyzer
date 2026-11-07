@@ -1,60 +1,20 @@
-import uuid
 import re
-from typing import List, Dict, Any, Callable
+import uuid
+from collections.abc import Iterator
+from typing import Any, Callable, Dict, List
+
 from app.parse import parse_log_line
 
-def chunk_log_file(
-    file_path: str, 
-    tokenize_fn: Callable[[str], List[int]], 
-    max_tokens_per_chunk: int = 1000
-) -> List[Dict[str, Any]]:
-    """
-    Reads a log file, parses and compacts lines, deduplicates consecutive identical lines,
-    and packs them into token-budgeted chunks with a 2-line context overlap.
-    """
+
+def iter_log_chunks(
+    file_path: str,
+    tokenize_fn: Callable[[str], List[int]],
+    max_tokens_per_chunk: int = 1000,
+) -> Iterator[Dict[str, Any]]:
+    """Streams parsed lines into bounded token chunks with a two-line overlap."""
     if max_tokens_per_chunk < 1:
         raise ValueError("max_tokens_per_chunk must be greater than zero")
 
-    raw_entries = []
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-        for idx, line in enumerate(f, start=1):
-            line_no, compacted, meta = parse_log_line(line, idx)
-            raw_entries.append({
-                "line_no": line_no,
-                "compacted": compacted,
-                "raw": meta["raw"],
-                "is_json": meta["is_json"],
-                "truncated": False,
-            })
-
-    if not raw_entries:
-        return []
-
-    # 1. Deduplicate consecutive identical lines (e.g., repeating SQL injection or error bursts)
-    deduped_entries = []
-    i = 0
-    while i < len(raw_entries):
-        current = raw_entries[i]
-        count = 1
-        end_line_no = current["line_no"]
-        repeated_line_numbers = [current["line_no"]]
-        current_without_line_number = re.sub(r"^L\d+\|", "", current["compacted"])
-        while (i + count < len(raw_entries) and 
-               re.sub(r"^L\d+\|", "", raw_entries[i + count]["compacted"]) == current_without_line_number and
-               raw_entries[i + count]["is_json"] == current["is_json"]):
-            end_line_no = raw_entries[i + count]["line_no"]
-            repeated_line_numbers.append(end_line_no)
-            count += 1
-        
-        entry_copy = current.copy()
-        if count > 1:
-            entry_copy["compacted"] = f"{current['line_no']}-{end_line_no} x{count}|{current['compacted']}"
-            entry_copy["repeat_line_numbers"] = repeated_line_numbers
-        
-        deduped_entries.append(entry_copy)
-        i += count
-
-    # Helper for accurate token counting using the model's tokenizer
     def count_tokens(text: str) -> int:
         try:
             return len(tokenize_fn(text))
@@ -81,63 +41,126 @@ def chunk_log_file(
                 best = best[:-1]
         return best
 
-    # 2. Greedy pack into token-budget chunks with 2-line overlap
-    chunks = []
-    current_chunk_lines = []
-    current_tokens = 0
-    chunk_start_line = deduped_entries[0]["line_no"]
+    def build_entry(line_no: int, raw_line: str) -> Dict[str, Any]:
+        parsed_line_no, compacted, metadata = parse_log_line(raw_line, line_no)
+        return {
+            "line_no": parsed_line_no,
+            "compacted": compacted,
+            "raw": metadata["raw"],
+            "is_json": metadata["is_json"],
+            "truncated": False,
+        }
 
-    def get_end_line(entry: Dict[str, Any]) -> int:
+    def end_line(entry: Dict[str, Any]) -> int:
         return entry.get("repeat_line_numbers", [entry["line_no"]])[-1]
 
-    for entry in deduped_entries:
+    current_chunk: List[Dict[str, Any]] = []
+    current_tokens = 0
+    chunk_start_line = 1
+    overlap_line_numbers: List[int] = []
+    pending_entry: Dict[str, Any] | None = None
+
+    def pack(entry: Dict[str, Any]) -> Dict[str, Any] | None:
+        nonlocal current_chunk, current_tokens, chunk_start_line
+        nonlocal overlap_line_numbers
         line_text = entry["compacted"]
         line_tokens = count_tokens(line_text)
-
-        # Handle oversized single lines exceeding budget
         if line_tokens > max_tokens_per_chunk:
             line_text = truncate_line(line_text)
             entry["compacted"] = line_text
             entry["truncated"] = True
             line_tokens = count_tokens(line_text)
 
-        if current_tokens + line_tokens > max_tokens_per_chunk and current_chunk_lines:
-            # Commit current chunk
-            chunks.append({
+        emitted = None
+        if current_tokens + line_tokens > max_tokens_per_chunk and current_chunk:
+            emitted = {
                 "chunk_id": str(uuid.uuid4()),
                 "start_line": chunk_start_line,
-                "end_line": get_end_line(current_chunk_lines[-1]),
+                "end_line": end_line(current_chunk[-1]),
                 "token_count": current_tokens,
-                "lines": current_chunk_lines,
-                "truncated": any(line.get("truncated", False) for line in current_chunk_lines)
-            })
-            # Carry over last 2 lines as context overlap
-            overlap = current_chunk_lines[-2:] if len(current_chunk_lines) >= 2 else current_chunk_lines
+                "lines": current_chunk,
+                "overlap_line_numbers": overlap_line_numbers,
+                "truncated": any(line.get("truncated", False) for line in current_chunk),
+            }
+            overlap = current_chunk[-2:]
             context_lines = [
-                dict(l, compacted=f"(context) {l['compacted']}")
-                for l in overlap
+                dict(line, compacted=f"(context) {line['compacted']}", is_context=True)
+                for line in overlap
             ]
             while context_lines and (
-                sum(count_tokens(l["compacted"]) for l in context_lines) + line_tokens
+                sum(count_tokens(line["compacted"]) for line in context_lines)
+                + line_tokens
                 > max_tokens_per_chunk
             ):
                 context_lines.pop(0)
-            current_chunk_lines = context_lines
-            current_tokens = sum(count_tokens(l["compacted"]) for l in current_chunk_lines)
-            chunk_start_line = current_chunk_lines[0]["line_no"] if current_chunk_lines else entry["line_no"]
-
-        current_chunk_lines.append(entry)
+            current_chunk = context_lines
+            current_tokens = sum(count_tokens(line["compacted"]) for line in current_chunk)
+            overlap_line_numbers = [
+                line_no
+                for line in context_lines
+                for line_no in line.get("repeat_line_numbers", [line["line_no"]])
+            ]
+            chunk_start_line = (
+                current_chunk[0]["line_no"] if current_chunk else entry["line_no"]
+            )
+        if not current_chunk:
+            chunk_start_line = entry["line_no"]
+        current_chunk.append(entry)
         current_tokens += line_tokens
+        return emitted
 
-    # Flush final chunk
-    if current_chunk_lines:
-        chunks.append({
+    with open(file_path, "r", encoding="utf-8", errors="replace") as source:
+        for line_no, raw_line in enumerate(source, start=1):
+            entry = build_entry(line_no, raw_line)
+            if pending_entry is None:
+                pending_entry = entry
+                pending_entry["repeat_line_numbers"] = [line_no]
+                pending_entry["_base_compacted"] = entry["compacted"]
+                continue
+
+            same_content = (
+                re.sub(r"^L\d+\|", "", pending_entry["_base_compacted"])
+                == re.sub(r"^L\d+\|", "", entry["compacted"])
+                and pending_entry["is_json"] == entry["is_json"]
+            )
+            if same_content:
+                pending_entry["repeat_line_numbers"].append(line_no)
+                pending_entry["compacted"] = (
+                    f"{pending_entry['line_no']}-{line_no} "
+                    f"x{len(pending_entry['repeat_line_numbers'])}|"
+                    f"{pending_entry['_base_compacted']}"
+                )
+                continue
+
+            pending_entry.pop("_base_compacted")
+            emitted = pack(pending_entry)
+            if emitted is not None:
+                yield emitted
+            pending_entry = entry
+            pending_entry["repeat_line_numbers"] = [line_no]
+            pending_entry["_base_compacted"] = entry["compacted"]
+
+    if pending_entry is not None:
+        pending_entry.pop("_base_compacted")
+        emitted = pack(pending_entry)
+        if emitted is not None:
+            yield emitted
+    if current_chunk:
+        yield {
             "chunk_id": str(uuid.uuid4()),
             "start_line": chunk_start_line,
-            "end_line": get_end_line(current_chunk_lines[-1]),
+            "end_line": end_line(current_chunk[-1]),
             "token_count": current_tokens,
-            "lines": current_chunk_lines,
-            "truncated": any(line.get("truncated", False) for line in current_chunk_lines)
-        })
+            "lines": current_chunk,
+            "overlap_line_numbers": overlap_line_numbers,
+            "truncated": any(line.get("truncated", False) for line in current_chunk),
+        }
 
-    return chunks
+
+def chunk_log_file(
+    file_path: str,
+    tokenize_fn: Callable[[str], List[int]],
+    max_tokens_per_chunk: int = 1000,
+) -> List[Dict[str, Any]]:
+    """Compatibility wrapper returning streamed chunks as a list."""
+    return list(iter_log_chunks(file_path, tokenize_fn, max_tokens_per_chunk))

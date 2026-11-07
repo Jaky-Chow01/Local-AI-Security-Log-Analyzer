@@ -17,12 +17,47 @@ document.addEventListener("DOMContentLoaded", () => {
     const newAnalysisBtn = document.getElementById("new-analysis-btn");
     const downloadReportBtn = document.getElementById("download-report-btn");
     const rawLineViewer = document.getElementById("raw-line-viewer");
+    const modelName = document.getElementById("model-name");
+    const modelRuntime = document.getElementById("model-runtime");
+    const modelTelemetry = document.getElementById("model-telemetry");
+    const chunkDetail = document.getElementById("chunk-detail");
+    const liveCoverage = document.getElementById("coverage-live");
+    const queuePosition = document.getElementById("queue-position");
 
     let currentJobId = null;
     let pollInterval = null;
     let startTime = null;
     let latestReport = null;
     const inspectedLines = new Set();
+
+    loadModelStatus();
+    setInterval(loadModelStatus, 3000);
+
+    async function loadModelStatus() {
+        try {
+            const response = await fetch("/api/model-status");
+            if (!response.ok) throw new Error("Could not load model configuration.");
+            const status = await response.json();
+            modelName.textContent = `Model: ${status.model_filename}`;
+            modelRuntime.textContent = status.mode;
+            modelRuntime.title = status.runtime;
+            const memory = status.memory_mb === null
+                ? "RAM: unavailable"
+                : `RAM: ${status.memory_mb.toFixed(0)} / ${status.memory_budget_mb} MB target${status.memory_kind === "peak-rss-estimate" ? " peak" : ""}`;
+            const inference = status.last_inference_seconds === null
+                ? "Last inference: —"
+                : `Last inference: ${status.last_inference_seconds.toFixed(2)} s`;
+            modelTelemetry.textContent = `${memory} · ${inference}`;
+            modelTelemetry.classList.toggle(
+                "over-budget",
+                status.memory_mb !== null && status.memory_mb >= status.memory_budget_mb
+            );
+            modelRuntime.textContent = `${status.mode} · ${status.model_loaded ? "loaded" : "configured"}`;
+        } catch (err) {
+            modelName.textContent = "Model: configuration unavailable";
+            console.error("Model status error", err);
+        }
+    }
 
     // Drag and Drop Handlers
     dropZone.addEventListener("click", () => fileInput.click());
@@ -134,6 +169,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     jobStatusText.textContent = "Local model unavailable; detector-only analysis.";
                 } else if (job.model_status === "degraded") {
                     jobStatusText.textContent = "Some model chunks failed; report will show coverage gaps.";
+                } else if (job.model_status === "filtered") {
+                    jobStatusText.textContent = "Deterministic prefiltering limited model calls; review filtered ranges.";
                 } else {
                     jobStatusText.textContent = `Processing (${job.model_status} model status)...`;
                 }
@@ -142,6 +179,12 @@ document.addEventListener("DOMContentLoaded", () => {
                 const completed = job.completed_chunks;
                 const total = job.total_chunks;
                 completedChunksCount.textContent = completed;
+                totalChunksCount.textContent = total;
+                queuePosition.textContent = job.queue_position === 0
+                    ? "Queue: processing"
+                    : job.queue_position
+                        ? `Queue position: ${job.queue_position}`
+                        : "Queue: not waiting";
                 
                 const pct = total > 0 ? (completed / total) * 100 : 0;
                 progressBar.style.width = `${pct}%`;
@@ -152,12 +195,34 @@ document.addEventListener("DOMContentLoaded", () => {
 
                 // Render chunk grid
                 chunkGrid.innerHTML = "";
+                const failedChunks = [];
+                const filteredChunks = [];
+                let activeChunk = null;
                 job.chunks.forEach((chunk, index) => {
                     const box = document.createElement("div");
                     box.className = `chunk-box ${chunk.status}`;
                     box.textContent = index + 1;
+                    const overlap = chunk.overlap_line_numbers || [];
+                    const duration = Number.isFinite(chunk.inference_seconds)
+                        ? ` · ${chunk.inference_seconds.toFixed(2)} s`
+                        : "";
+                    box.title = `Chunk ${index + 1}: lines ${chunk.start_line}-${chunk.end_line}, ${chunk.token_count} tokens, overlap ${overlap.length ? overlap.join(", ") : "none"}${duration}`;
                     chunkGrid.appendChild(box);
+                    if (["running", "retrying"].includes(chunk.status)) activeChunk = chunk;
+                    if (chunk.status === "failed" || chunk.status === "pending") {
+                        failedChunks.push(`${chunk.start_line}-${chunk.end_line} (${chunk.status})`);
+                    }
+                    if (chunk.status === "skipped") {
+                        filteredChunks.push(`${chunk.start_line}-${chunk.end_line}`);
+                    }
                 });
+                chunkDetail.textContent = activeChunk
+                    ? `Current chunk: lines ${activeChunk.start_line}-${activeChunk.end_line} · ${activeChunk.token_count} tokens · overlap: ${(activeChunk.overlap_line_numbers || []).join(", ") || "none"}`
+                    : `${total} chunks · hover a chunk for token budget, line range, overlap, and inference time.`;
+                liveCoverage.textContent = [
+                    failedChunks.length ? `Failed/unprocessed: ${failedChunks.join(", ")}` : "No failed or unprocessed ranges.",
+                    filteredChunks.length ? `Prefiltered from model: ${filteredChunks.join(", ")}` : ""
+                ].filter(Boolean).join(" ");
 
                 if (job.status === "complete" || job.status === "partial" || job.status === "failed") {
                     clearInterval(pollInterval);
@@ -208,6 +273,11 @@ document.addEventListener("DOMContentLoaded", () => {
             `Failed or unfinished ranges: ${coverage.failed_ranges.length
                 ? coverage.failed_ranges.map(range =>
                     `${range.start_line}-${range.end_line} (${range.status})`).join(", ")
+                : "none"}`;
+        document.getElementById("coverage-filtered-ranges").textContent =
+            `Ranges skipped by deterministic prefilter: ${coverage.filtered_ranges?.length
+                ? coverage.filtered_ranges.map(range =>
+                    `${range.start_line}-${range.end_line}`).join(", ")
                 : "none"}`;
         document.getElementById("coverage-truncated-lines").textContent =
             `Truncated source lines: ${coverage.truncated_lines.length

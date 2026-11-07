@@ -33,6 +33,13 @@ If the model is missing or cannot load, deterministic detectors still analyze
 the upload and the job/report explicitly identifies the run as detector-only.
 Model failures, timeouts, and incomplete chunk ranges are reported as partial
 coverage rather than as an empty successful AI result.
+The dashboard reports the active model filename, process RSS, and most recent
+native inference duration. `MODEL_PATH` is read at startup; changing models
+requires restarting the server so a model is never replaced during inference.
+Set `MODEL_PREFILTER_ENABLED=true` to skip model calls for chunks with no
+deterministic detector evidence. This reduces inference work but may miss novel
+attacks that do not match the detectors; skipped ranges are explicitly listed
+in the progress view and report.
 
 ## Run
 
@@ -47,9 +54,10 @@ stored in `app/db.sqlite`.
 
 ## Analysis behavior
 
-- Input is split on whole log lines into token-budgeted chunks with up to two
-  lines of context overlap. Long individual lines are truncated to fit and are
-  listed in report coverage.
+- Input is streamed from disk into bounded token-budgeted chunk buffers with up
+  to two lines of context overlap. Chunk progress exposes token counts, line
+  ranges, overlap line numbers, and inference durations. Long individual lines
+  are truncated to fit and are listed in report coverage.
 - Deterministic detectors run before local model classification. They identify
   common web, authentication, rate-abuse, and suspicious-input patterns.
 - The model is called sequentially with a JSON-schema grammar, bounded retries,
@@ -99,6 +107,10 @@ because the GGUF model is not included. Set `LLM_TIMEOUT_SECONDS` based on a
 benchmark on the deployment hardware; 120 seconds is a conservative default,
 not a certified runtime. A benchmark result only applies to the hardware,
 runtime, model, prompt size, and container limits used for that run.
+The dashboard's RSS value measures this Python process, not total system RAM.
+The 4 GiB limit is an environment/deployment target and is not enforceable by
+portable application code; verify it with the benchmark under the target
+container or operating-system memory limit.
 
 ## Tests
 

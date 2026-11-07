@@ -12,6 +12,11 @@
         <header>
             <h1>🔒 Local AI Security Log Analyzer</h1>
             <p>Offline Hybrid Deterministic-LLM SIEM & Forensic Forensics Workbench</p>
+            <div class="model-status" aria-label="Model runtime status">
+                <span id="model-name" class="model-name">Model: loading configuration</span>
+                <span id="model-runtime" class="model-runtime">Local / llama.cpp</span>
+                <span id="model-telemetry" class="model-telemetry">RAM: — · Last inference: —</span>
+            </div>
         </header>
 
         <!-- Upload View -->
@@ -38,8 +43,11 @@
             <div class="chunk-metrics">
                 <span>Completed Chunks: <strong id="completed-chunks-count">0</strong> / <span id="total-chunks-count">0</span></span>
                 <span id="elapsed-time">Elapsed: 0s</span>
+                <span id="queue-position">Queue position: —</span>
             </div>
             <h3>Chunk Processing Grid</h3>
+            <p id="chunk-detail" class="coverage-note" aria-live="polite">Waiting for chunk metadata…</p>
+            <p id="coverage-live" class="coverage-note" aria-live="polite"></p>
             <div id="chunk-grid" class="chunk-grid"></div>
             <div class="actions">
                 <button id="cancel-btn" class="btn btn-danger">Cancel Analysis</button>
@@ -88,6 +96,7 @@
                 <h3>Analysis Coverage</h3>
                 <p id="model-availability"></p>
                 <p id="coverage-failed-ranges"></p>
+                <p id="coverage-filtered-ranges"></p>
                 <p id="coverage-truncated-lines"></p>
                 <p id="coverage-rejected-findings"></p>
             </section>

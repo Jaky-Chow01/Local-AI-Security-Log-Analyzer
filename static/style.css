@@ -45,6 +45,58 @@ header .subtitle {
     color: var(--text-muted);
 }
 
+.model-status {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 0.85rem;
+    font-size: 0.8rem;
+}
+
+.model-name,
+.model-runtime,
+.model-telemetry {
+    border: 1px solid var(--border-color);
+    border-radius: 999px;
+    background-color: var(--card-bg);
+    padding: 0.2rem 0.65rem;
+}
+
+.model-name {
+    max-width: min(100%, 28rem);
+    overflow: hidden;
+    color: var(--text-muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.model-runtime {
+    color: var(--text-color);
+    white-space: nowrap;
+}
+
+.model-telemetry {
+    color: var(--text-muted);
+}
+
+.model-telemetry.over-budget {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.model-runtime::before {
+    display: inline-block;
+    width: 0.45rem;
+    height: 0.45rem;
+    margin-right: 0.4rem;
+    border-radius: 50%;
+    background-color: var(--success);
+    content: "";
+    vertical-align: 0.05rem;
+}
+
 .card {
     background-color: var(--card-bg);
     border: 1px solid var(--border-color);
@@ -109,10 +161,18 @@ header .subtitle {
 
 .chunk-metrics {
     display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 1rem;
     justify-content: space-between;
     color: var(--text-muted);
     font-size: 0.9rem;
     margin-bottom: 1.5rem;
+}
+
+.coverage-note {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin: 0.4rem 0;
 }
 
 .chunk-grid {
@@ -124,8 +184,9 @@ header .subtitle {
 }
 
 .chunk-box {
-    width: 36px;
-    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0.2rem;
     border-radius: 4px;
     display: flex;
     align-items: center;
@@ -140,6 +201,7 @@ header .subtitle {
 .chunk-box.running { background-color: var(--warning); color: #000; animation: pulse 1.5s infinite; }
 .chunk-box.done { background-color: var(--success); color: #fff; }
 .chunk-box.failed { background-color: var(--danger); color: #fff; }
+.chunk-box.skipped { background-color: #475569; color: var(--text-color); }
 
 @keyframes pulse {
     0% { opacity: 0.6; }

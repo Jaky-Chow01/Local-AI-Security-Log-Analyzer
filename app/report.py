@@ -119,11 +119,20 @@ def generate_json_report(job_id: str) -> Dict[str, Any]:
     )
 
     failed_ranges = []
+    filtered_ranges = []
     truncated_lines = set()
     rejected_chunk_data = 0
     for chunk in chunk_rows:
         failed_range = None
-        if chunk["status"] != "done":
+        if chunk["status"] == "skipped":
+            filtered_ranges.append(
+                {
+                    "start_line": chunk["start_line"],
+                    "end_line": chunk["end_line"],
+                    "status": "skipped_by_deterministic_prefilter",
+                }
+            )
+        elif chunk["status"] != "done":
             failed_range = {
                 "start_line": chunk["start_line"],
                 "end_line": chunk["end_line"],
@@ -188,6 +197,10 @@ def generate_json_report(job_id: str) -> Dict[str, Any]:
         limitations.append(
             "One or more model chunks failed; findings and coverage may be incomplete."
         )
+    if filtered_ranges:
+        limitations.append(
+            "Deterministic prefiltering skipped model inference for ranges listed in coverage.filtered_ranges; novel attacks without detector signatures may be missed."
+        )
     if failed_ranges:
         limitations.append(
             "Failed or unfinished chunks are listed in coverage.failed_ranges."
@@ -221,6 +234,7 @@ def generate_json_report(job_id: str) -> Dict[str, Any]:
         "findings": merged_findings,
         "coverage": {
             "failed_ranges": failed_ranges,
+            "filtered_ranges": filtered_ranges,
             "truncated_lines": sorted(truncated_lines),
             "rejected_model_findings": job["rejected_model_findings"],
             "rejected_report_findings": rejected_report_findings,

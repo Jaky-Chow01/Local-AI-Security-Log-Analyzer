@@ -1,12 +1,13 @@
 import json
 import logging
+import os
 import queue
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.chunker import chunk_log_file
+from app.chunker import iter_log_chunks
 from app.db import get_db_connection, save_job_chunks
 from app.detectors import run_deterministic_detectors
 from app.llm import (
@@ -32,6 +33,8 @@ class JobQueueManager:
     def __init__(self) -> None:
         self.job_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
         self.cancel_flags: Dict[str, threading.Event] = {}
+        self.active_job_id: Optional[str] = None
+        self.active_job_lock = threading.Lock()
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
         self.recover_pending_jobs()
@@ -109,6 +112,18 @@ class JobQueueManager:
         if event is not None:
             event.set()
 
+    def get_queue_position(self, job_id: str) -> Optional[int]:
+        """Returns 0 for active, or 1-based position among queued jobs."""
+        with self.active_job_lock:
+            if self.active_job_id == job_id:
+                return 0
+        with self.job_queue.mutex:
+            queued_jobs = [queued_id for queued_id, _ in self.job_queue.queue]
+        try:
+            return queued_jobs.index(job_id) + 1
+        except ValueError:
+            return None
+
     def _worker_loop(self) -> None:
         """Single-flight background worker thread loop."""
         while True:
@@ -117,6 +132,8 @@ class JobQueueManager:
             except queue.Empty:
                 continue
 
+            with self.active_job_lock:
+                self.active_job_id = job_id
             try:
                 self._process_job(job_id, file_path)
             except Exception:
@@ -128,6 +145,8 @@ class JobQueueManager:
                     )
                     conn.commit()
             finally:
+                with self.active_job_lock:
+                    self.active_job_id = None
                 self.job_queue.task_done()
                 self.cancel_flags.pop(job_id, None)
 
@@ -147,16 +166,18 @@ class JobQueueManager:
             ).fetchall()
 
         if not all_chunk_rows and file_path is not None:
-            chunks = chunk_log_file(
-                file_path,
-                get_tokenizer_fn(),
-                max_tokens_per_chunk=min(
-                    MAX_TOKENS_PER_CHUNK,
-                    min(get_model_context_size(), MAX_INFERENCE_TOKENS)
-                    - MODEL_PROMPT_RESERVE_TOKENS,
+            save_job_chunks(
+                job_id,
+                iter_log_chunks(
+                    file_path,
+                    get_tokenizer_fn(),
+                    max_tokens_per_chunk=min(
+                        MAX_TOKENS_PER_CHUNK,
+                        min(get_model_context_size(), MAX_INFERENCE_TOKENS)
+                        - MODEL_PROMPT_RESERVE_TOKENS,
+                    ),
                 ),
             )
-            save_job_chunks(job_id, chunks)
             with get_db_connection() as conn:
                 all_chunk_rows = conn.execute(
                     "SELECT * FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC;",
@@ -173,6 +194,45 @@ class JobQueueManager:
 
         deterministic_findings = run_deterministic_detectors(all_lines)
         self._persist_deterministic_findings(job_id, deterministic_findings)
+        filtered_any_chunks = any(row["status"] == "skipped" for row in all_chunk_rows)
+        if os.getenv("MODEL_PREFILTER_ENABLED", "").lower() in {"1", "true", "yes"}:
+            high_risk_lines = {
+                line_no
+                for finding in deterministic_findings
+                for line_no in finding.get("evidence_lines", [])
+            }
+            filtered_chunks = [
+                row
+                for row in pending_chunk_rows
+                if not any(
+                    line_no in high_risk_lines
+                    for line_no in range(row["start_line"], row["end_line"] + 1)
+                )
+            ]
+            if filtered_chunks:
+                filtered_any_chunks = True
+                with get_db_connection() as conn:
+                    conn.executemany(
+                        "UPDATE chunks SET status = 'skipped' WHERE chunk_id = ?;",
+                        [(row["chunk_id"],) for row in filtered_chunks],
+                    )
+                    conn.execute(
+                        """
+                        UPDATE jobs SET completed_chunks = (
+                                SELECT COUNT(*) FROM chunks
+                                WHERE job_id = ? AND status IN ('done', 'failed', 'skipped')
+                            ),
+                            model_status = 'filtered',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE job_id = ?;
+                        """,
+                        (job_id, job_id),
+                    )
+                    conn.commit()
+                filtered_ids = {row["chunk_id"] for row in filtered_chunks}
+                pending_chunk_rows = [
+                    row for row in pending_chunk_rows if row["chunk_id"] not in filtered_ids
+                ]
 
         if pending_chunk_rows:
             self._rebuild_ledger(
@@ -227,10 +287,10 @@ class JobQueueManager:
         with get_db_connection() as conn:
             conn.execute(
                 """
-                UPDATE jobs SET model_status = 'available', model_name = ?,
+                UPDATE jobs SET model_status = ?, model_name = ?,
                     updated_at = CURRENT_TIMESTAMP WHERE job_id = ?;
                 """,
-                (model_name, job_id),
+                ("filtered" if filtered_any_chunks else "available", model_name, job_id),
             )
             conn.commit()
 
@@ -240,9 +300,17 @@ class JobQueueManager:
 
             chunk_id = chunk_row["chunk_id"]
             lines = json.loads(chunk_row["compacted_data"])
+            with get_db_connection() as conn:
+                conn.execute(
+                    "UPDATE chunks SET status = 'running' WHERE chunk_id = ?;",
+                    (chunk_id,),
+                )
+                conn.commit()
+            inference_started = time.monotonic()
             model_findings, inference_complete = self._classify_with_retries(
                 job_id, chunk_id, llm_manager, lines, cancel_event
             )
+            chunk_duration = time.monotonic() - inference_started
             rejected_count = self._persist_model_findings(
                 job_id, chunk_id, lines, model_findings
             )
@@ -250,18 +318,24 @@ class JobQueueManager:
             chunk_status = "done" if inference_complete else "failed"
             with get_db_connection() as conn:
                 conn.execute(
-                    "UPDATE chunks SET status = ? WHERE chunk_id = ?;",
-                    (chunk_status, chunk_id),
+                    """
+                    UPDATE chunks SET status = ?, inference_seconds = ?
+                    WHERE chunk_id = ?;
+                    """,
+                    (chunk_status, chunk_duration, chunk_id),
                 )
                 conn.execute(
                     """
                     UPDATE jobs
                     SET completed_chunks = (
                             SELECT COUNT(*) FROM chunks
-                            WHERE job_id = ? AND status IN ('done', 'failed')
+                            WHERE job_id = ? AND status IN ('done', 'failed', 'skipped')
                         ),
                         rejected_model_findings = rejected_model_findings + ?,
-                        model_status = CASE WHEN ? = 1 THEN model_status ELSE 'degraded' END,
+                        model_status = CASE WHEN ? = 1
+                            THEN CASE WHEN model_status = 'filtered'
+                                THEN 'filtered' ELSE model_status END
+                            ELSE 'degraded' END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE job_id = ?;
                     """,
@@ -306,7 +380,7 @@ class JobQueueManager:
                     model_name = NULL,
                     completed_chunks = (
                         SELECT COUNT(*) FROM chunks
-                        WHERE job_id = ? AND status IN ('done', 'failed')
+                        WHERE job_id = ? AND status IN ('done', 'failed', 'skipped')
                     ),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE job_id = ?;

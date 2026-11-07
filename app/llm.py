@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import queue
 import threading
 import time
@@ -31,8 +32,11 @@ class ModelBusyError(ModelExecutionError):
 _INFERENCE_LOCK = threading.Lock()
 DEFAULT_INFERENCE_TIMEOUT_SECONDS = 120
 DEFAULT_MODEL_CONTEXT_SIZE = 2048
+DEFAULT_MODEL_PATH = "models/qwen2.5-3b-instruct-q4_k_m.gguf"
 MAX_INFERENCE_TOKENS = 2048
 MAX_OUTPUT_TOKENS = 400
+_METRICS_LOCK = threading.Lock()
+_LAST_INFERENCE_SECONDS: Optional[float] = None
 
 
 def get_inference_timeout_seconds() -> int:
@@ -84,14 +88,20 @@ class LLMManager:
     ) -> "LLMManager":
         with cls._lock:
             if cls._instance is None:
-                path = model_path or os.getenv(
-                    "MODEL_PATH", "models/qwen2.5-3b-instruct-q4_k_m.gguf"
-                )
+                path = model_path or cls.get_configured_model_path()
                 cls._instance = cls(
                     model_path=path,
                     n_ctx=n_ctx if n_ctx is not None else get_model_context_size(),
                 )
             return cls._instance
+
+    @classmethod
+    def get_configured_model_path(cls) -> str:
+        """Returns the active model path or its configured default without loading it."""
+        manager = cls._instance
+        if manager is not None:
+            return manager.model_path
+        return os.getenv("MODEL_PATH") or DEFAULT_MODEL_PATH
 
     def _load_model(self) -> None:
         if not os.path.exists(self.model_path):
@@ -155,12 +165,143 @@ class LLMManager:
             timeout if timeout is not None else get_inference_timeout_seconds(),
         )
         try:
-            result = json.loads(response["choices"][0]["text"].strip())
+            model_text = response["choices"][0]["text"]
+            if not isinstance(model_text, str):
+                raise TypeError("Model response text is not a string.")
+            result = _parse_model_response(model_text)
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
             raise ModelExecutionError(f"Model output was not valid JSON: {exc}") from exc
         if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
             raise ModelExecutionError("Model output does not match the findings schema.")
         return result
+
+
+def _parse_model_response(text: str) -> Dict[str, Any]:
+    """Recovers a valid schema-shaped JSON object from otherwise noisy output."""
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.removeprefix("```json").removeprefix("```").strip()
+        if candidate.endswith("```"):
+            candidate = candidate[:-3].strip()
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as original_error:
+        parsed = None
+        decoder = json.JSONDecoder()
+        for offset, char in enumerate(candidate):
+            if char != "{":
+                continue
+            try:
+                possible, _ = decoder.raw_decode(candidate, offset)
+            except json.JSONDecodeError:
+                continue
+            if _matches_model_schema(possible):
+                parsed = possible
+                break
+        if parsed is None:
+            raise original_error
+    if not _matches_model_schema(parsed):
+        raise json.JSONDecodeError("Response does not match the findings schema", text, 0)
+    return parsed
+
+
+def _matches_model_schema(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {"findings"}:
+        return False
+    findings = value["findings"]
+    if not isinstance(findings, list):
+        return False
+
+    properties = LOG_CLASSIFICATION_SCHEMA["properties"]["findings"]["items"]["properties"]
+    expected_fields = set(properties)
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != expected_fields:
+            return False
+        if (
+            finding["attack_type"] not in properties["attack_type"]["enum"]
+            or finding["severity"] not in properties["severity"]["enum"]
+            or not isinstance(finding["identifier"], str)
+            or not isinstance(finding["evidence_lines"], list)
+            or any(
+                not isinstance(line_no, int) or isinstance(line_no, bool)
+                for line_no in finding["evidence_lines"]
+            )
+            or not isinstance(finding["reasoning"], str)
+            or not isinstance(finding["suggested_actions"], list)
+            or any(not isinstance(action, str) for action in finding["suggested_actions"])
+            or not isinstance(finding["confidence"], (int, float))
+            or isinstance(finding["confidence"], bool)
+        ):
+            return False
+    return True
+
+
+def get_runtime_metrics() -> Dict[str, Any]:
+    """Returns lightweight process RSS and most recent native inference duration."""
+    memory_mb, memory_kind = _get_process_memory_mb()
+    with _METRICS_LOCK:
+        inference_seconds = _LAST_INFERENCE_SECONDS
+    return {
+        "memory_mb": memory_mb,
+        "memory_kind": memory_kind,
+        "last_inference_seconds": inference_seconds,
+    }
+
+
+def _get_process_memory_mb() -> tuple[Optional[float], str]:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCounters),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        if not psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            raise OSError("GetProcessMemoryInfo failed.")
+        return counters.WorkingSetSize / (1024 * 1024), "rss"
+
+    statm_path = "/proc/self/statm"
+    if os.path.exists(statm_path):
+        with open(statm_path, encoding="ascii") as statm:
+            resident_pages = int(statm.read().split()[1])
+        return (
+            resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024),
+            "rss",
+        )
+
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_bytes = peak if sys.platform == "darwin" else peak * 1024
+        return peak_bytes / (1024 * 1024), "peak-rss-estimate"
+    except (ImportError, OSError):
+        return None, "unavailable"
 
 
 def _run_inference(
@@ -178,6 +319,7 @@ def _run_inference(
         return time.monotonic() >= deadline
 
     def run() -> None:
+        global _LAST_INFERENCE_SECONDS
         remaining = max(0.0, deadline - time.monotonic())
         acquired = _INFERENCE_LOCK.acquire(timeout=remaining)
         if not acquired:
@@ -204,7 +346,12 @@ def _run_inference(
                     )
                 )
                 return
-            response = invoke(StoppingCriteriaList([has_timed_out]))
+            inference_started = time.monotonic()
+            try:
+                response = invoke(StoppingCriteriaList([has_timed_out]))
+            finally:
+                with _METRICS_LOCK:
+                    _LAST_INFERENCE_SECONDS = time.monotonic() - inference_started
             if time.monotonic() >= deadline:
                 raise ModelExecutionError(f"LLM inference timed out after {timeout} seconds.")
             result_queue.put((True, response))

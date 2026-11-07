@@ -10,6 +10,7 @@ from app.db import get_job_line, get_job_status, init_db, save_job_record
 from app.validate import ValidationError, save_upload_stream
 from app.queue import JobQueueManager
 from app.report import generate_json_report
+from app.llm import DEFAULT_MODEL_PATH, LLMManager, get_runtime_metrics
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
@@ -40,6 +41,19 @@ def read_index():
     if index_path.exists():
         return FileResponse(index_path)
     return {"message": "Local AI Security Log Analyzer API is running. Upload logs via POST /api/upload."}
+
+@app.get("/api/model-status")
+def get_model_status():
+    """Returns the configured local model identity without initializing inference."""
+    model_path = LLMManager.get_configured_model_path()
+    return {
+        "model_filename": Path(model_path or DEFAULT_MODEL_PATH).name,
+        "runtime": "llama.cpp",
+        "mode": "Local / offline",
+        "model_loaded": LLMManager._instance is not None,
+        "memory_budget_mb": 4096,
+        **get_runtime_metrics(),
+    }
 
 @app.post("/api/upload")
 async def upload_log_file(file: UploadFile = File(...)):
@@ -83,6 +97,8 @@ def get_job(job_id: str):
     status = get_job_status(job_id)
     if not status:
         raise HTTPException(status_code=404, detail="Job not found.")
+    status["queue_position"] = JobQueueManager.get_instance().get_queue_position(job_id)
+    status["runtime_metrics"] = get_runtime_metrics()
     return status
 
 @app.get("/api/jobs/{job_id}/lines/{line_no}")

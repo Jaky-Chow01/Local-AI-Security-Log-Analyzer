@@ -1,5 +1,6 @@
 import sqlite3
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -41,6 +42,8 @@ def init_db() -> None:
                 token_count INTEGER NOT NULL,
                 status TEXT NOT NULL, -- pending, running, done, retrying, failed
                 compacted_data TEXT NOT NULL, -- JSON serialized lines
+                overlap_line_numbers TEXT NOT NULL DEFAULT '[]',
+                inference_seconds REAL,
                 FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
             );
 
@@ -72,6 +75,15 @@ def init_db() -> None:
         existing_columns = {
             row["name"] for row in conn.execute("PRAGMA table_info(jobs);").fetchall()
         }
+        existing_chunk_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(chunks);").fetchall()
+        }
+        for column, declaration in (
+            ("overlap_line_numbers", "TEXT NOT NULL DEFAULT '[]'"),
+            ("inference_seconds", "REAL"),
+        ):
+            if column not in existing_chunk_columns:
+                conn.execute(f"ALTER TABLE chunks ADD COLUMN {column} {declaration};")
         for column, declaration in (
             ("model_status", "TEXT NOT NULL DEFAULT 'pending'"),
             ("model_name", "TEXT"),
@@ -97,7 +109,7 @@ def init_db() -> None:
             SET completed_chunks = (
                 SELECT COUNT(*) FROM chunks
                 WHERE chunks.job_id = jobs.job_id
-                  AND chunks.status IN ('done', 'failed')
+                  AND chunks.status IN ('done', 'failed', 'skipped')
             );
         """)
         conn.commit()
@@ -126,16 +138,17 @@ def save_job_record(job_id: str, filename: str, total_lines: int, chunks: List[D
         conn.commit()
 
 
-def save_job_chunks(job_id: str, chunks: List[Dict[str, Any]]) -> None:
-    """Persists background-created chunks and publishes their count atomically."""
+def save_job_chunks(job_id: str, chunks: Iterable[Dict[str, Any]]) -> None:
+    """Persists streamed chunks and publishes their count atomically."""
     with get_db_connection() as conn:
+        total_chunks = 0
         for idx, chunk in enumerate(chunks):
             conn.execute(
                 """
                 INSERT INTO chunks
                 (chunk_id, job_id, chunk_index, start_line, end_line, token_count,
-                 status, compacted_data)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?);
+                 status, compacted_data, overlap_line_numbers)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?);
                 """,
                 (
                     chunk["chunk_id"],
@@ -145,15 +158,17 @@ def save_job_chunks(job_id: str, chunks: List[Dict[str, Any]]) -> None:
                     chunk["end_line"],
                     chunk["token_count"],
                     json.dumps(chunk["lines"]),
+                    json.dumps(chunk.get("overlap_line_numbers", [])),
                 ),
             )
+            total_chunks = idx + 1
         conn.execute(
             """
             UPDATE jobs
             SET total_chunks = ?, updated_at = CURRENT_TIMESTAMP
             WHERE job_id = ?;
             """,
-            (len(chunks), job_id),
+            (total_chunks, job_id),
         )
         conn.commit()
 
@@ -164,7 +179,14 @@ def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
         if not row:
             return None
         
-        chunks = conn.execute("SELECT chunk_id, chunk_index, status FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC;", (job_id,)).fetchall()
+        chunks = conn.execute(
+            """
+            SELECT chunk_id, chunk_index, start_line, end_line, token_count,
+                status, overlap_line_numbers, inference_seconds
+            FROM chunks WHERE job_id = ? ORDER BY chunk_index ASC;
+            """,
+            (job_id,),
+        ).fetchall()
         return {
             "job_id": row["job_id"],
             "filename": row["filename"],
@@ -174,7 +196,15 @@ def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
             "completed_chunks": row["completed_chunks"],
             "model_status": row["model_status"],
             "model_name": row["model_name"],
-            "chunks": [dict(c) for c in chunks]
+            "chunks": [
+                {
+                    **dict(chunk),
+                    "overlap_line_numbers": json.loads(
+                        chunk["overlap_line_numbers"] or "[]"
+                    ),
+                }
+                for chunk in chunks
+            ],
         }
 
 

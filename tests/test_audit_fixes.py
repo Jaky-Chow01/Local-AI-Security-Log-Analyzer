@@ -6,15 +6,18 @@ from pathlib import Path
 import pytest
 
 import app.db as db
+import app.main as main_module
 import app.queue as queue_module
-from app.chunker import chunk_log_file
+from app.chunker import chunk_log_file, iter_log_chunks
 from app.detectors import run_deterministic_detectors
 from app.llm import (
     InferenceTimeoutError,
     LLMManager,
     ModelBusyError,
     ModelExecutionError,
+    _INFERENCE_LOCK,
     get_inference_timeout_seconds,
+    _parse_model_response,
 )
 from app.merge import merge_and_correlate_findings
 from app.parse import parse_log_line
@@ -22,6 +25,23 @@ from app.prompts import build_chunk_prompt
 from app.queue import JobQueueManager
 from app.report import generate_json_report
 from app.validate import ValidationError, save_upload_stream, validate_upload_file
+
+
+def test_model_status_uses_configured_filename_without_loading_model(
+    tmp_path, monkeypatch
+):
+    model_path = tmp_path / "Mistral-7B-Instruct-v0.2.Q4_K_M.gguf"
+    monkeypatch.setattr(main_module.LLMManager, "_instance", None)
+    monkeypatch.setenv("MODEL_PATH", str(model_path))
+
+    status = main_module.get_model_status()
+
+    assert status["model_filename"] == model_path.name
+    assert status["runtime"] == "llama.cpp"
+    assert status["mode"] == "Local / offline"
+    assert status["model_loaded"] is False
+    assert status["memory_budget_mb"] == 4096
+    assert main_module.LLMManager._instance is None
 
 
 def test_startup_recovery_queries_chunks_and_requeues_pending_job(
@@ -213,6 +233,9 @@ def test_worker_chunks_upload_after_job_is_queued(tmp_path, monkeypatch):
     assert status["status"] == "partial"
     assert status["total_chunks"] == 1
     assert status["chunks"][0]["status"] == "failed"
+    assert status["chunks"][0]["start_line"] == 1
+    assert status["chunks"][0]["token_count"] > 0
+    assert status["chunks"][0]["overlap_line_numbers"] == []
 
 
 def _insert_job_and_chunk(monkeypatch, database_path, lines, status="pending"):
@@ -380,6 +403,104 @@ def test_chunker_marks_truncation_and_respects_token_budget(tmp_path):
     assert all(chunk["token_count"] <= 20 for chunk in chunks)
 
 
+def test_streaming_chunker_preserves_overlap_and_line_ranges(tmp_path):
+    log_path = tmp_path / "streamed.log"
+    log_path.write_text("first\nsecond\nthird\nfourth\n", encoding="utf-8")
+
+    streamed_chunks = iter_log_chunks(
+        str(log_path), lambda text: text.split(), max_tokens_per_chunk=3
+    )
+    first_chunk = next(streamed_chunks)
+    remaining_chunks = list(streamed_chunks)
+    chunks = [first_chunk, *remaining_chunks]
+
+    assert len(chunks) > 1
+    assert chunks[0]["overlap_line_numbers"] == []
+    assert chunks[1]["overlap_line_numbers"]
+    assert all(chunk["token_count"] <= 3 for chunk in chunks)
+    assert all(
+        line_no in range(1, 5)
+        for chunk in chunks
+        for line_no in chunk["overlap_line_numbers"]
+    )
+
+
+def test_deterministic_prefilter_reports_skipped_ranges(tmp_path, monkeypatch):
+    database_path = tmp_path / "prefilter.sqlite"
+    monkeypatch.setattr(db, "DB_PATH", database_path)
+    monkeypatch.setenv("MODEL_PREFILTER_ENABLED", "true")
+    db.init_db()
+    lines = [
+        {
+            "line_no": 1,
+            "compacted": "L1|/wp-admin",
+            "raw": '{"client_ip":"203.0.113.1","path":"/wp-admin","status":404}',
+            "is_json": True,
+        },
+        {
+            "line_no": 2,
+            "compacted": "L2|/health",
+            "raw": '{"client_ip":"203.0.113.2","path":"/health","status":200}',
+            "is_json": True,
+        },
+    ]
+    with db.get_db_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO jobs (job_id, filename, status, total_lines, total_chunks)
+            VALUES ('job-prefilter', 'events.log', 'queued', 2, 2);
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO chunks
+            (chunk_id, job_id, chunk_index, start_line, end_line, token_count,
+             status, compacted_data)
+            VALUES (?, 'job-prefilter', ?, ?, ?, 4, 'pending', ?);
+            """,
+            [
+                ("risky", 0, 1, 1, json.dumps([lines[0]])),
+                ("routine", 1, 2, 2, json.dumps([lines[1]])),
+            ],
+        )
+        conn.commit()
+    monkeypatch.setattr(
+        queue_module.LLMManager,
+        "get_instance",
+        classmethod(lambda _cls: (_ for _ in ()).throw(FileNotFoundError("missing"))),
+    )
+
+    manager = object.__new__(JobQueueManager)
+    manager.cancel_flags = {}
+    manager._process_job("job-prefilter")
+    report = generate_json_report("job-prefilter")
+
+    assert report["status"] == "partial"
+    assert report["coverage"]["filtered_ranges"] == [
+        {
+            "start_line": 2,
+            "end_line": 2,
+            "status": "skipped_by_deterministic_prefilter",
+        }
+    ]
+    assert report["coverage"]["failed_ranges"] == [
+        {"start_line": 1, "end_line": 1, "status": "failed"}
+    ]
+
+
+def test_model_response_parser_recovers_wrapped_json_and_rejects_broken_json():
+    assert _parse_model_response(
+        'Result follows: {"findings": []} trailing text'
+    ) == {"findings": []}
+    assert _parse_model_response(
+        '```json\n{"findings": []}\n```'
+    ) == {"findings": []}
+    with pytest.raises(json.JSONDecodeError):
+        _parse_model_response('{"findings": [')
+    with pytest.raises(json.JSONDecodeError):
+        _parse_model_response('{"findings": [], "extra": true}')
+
+
 def test_detectors_report_brute_force_without_success_and_unauthorized_access():
     entries = [
         {
@@ -481,6 +602,9 @@ def test_manager_classification_enforces_configured_timeout():
 
 
 def test_following_model_call_waits_for_timed_out_inference():
+    assert _INFERENCE_LOCK.acquire(timeout=1)
+    _INFERENCE_LOCK.release()
+
     class SlowFirstModel:
         calls = 0
 
