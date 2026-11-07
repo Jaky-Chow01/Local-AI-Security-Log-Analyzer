@@ -15,10 +15,14 @@ document.addEventListener("DOMContentLoaded", () => {
     const chunkGrid = document.getElementById("chunk-grid");
     const cancelBtn = document.getElementById("cancel-btn");
     const newAnalysisBtn = document.getElementById("new-analysis-btn");
+    const downloadReportBtn = document.getElementById("download-report-btn");
+    const rawLineViewer = document.getElementById("raw-line-viewer");
 
     let currentJobId = null;
     let pollInterval = null;
     let startTime = null;
+    let latestReport = null;
+    const inspectedLines = new Set();
 
     // Drag and Drop Handlers
     dropZone.addEventListener("click", () => fileInput.click());
@@ -56,10 +60,34 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     newAnalysisBtn.addEventListener("click", () => {
+        if (pollInterval) clearInterval(pollInterval);
         reportView.classList.add("hidden");
+        progressView.classList.add("hidden");
         uploadView.classList.remove("hidden");
         fileInput.value = "";
         currentJobId = null;
+        latestReport = null;
+        inspectedLines.clear();
+        rawLineViewer.replaceChildren();
+    });
+
+    downloadReportBtn.addEventListener("click", async () => {
+        if (!currentJobId || !latestReport) return;
+        try {
+            const response = await fetch(`/api/jobs/${currentJobId}/report`);
+            if (!response.ok) throw new Error("Failed to download the report.");
+            const blob = new Blob([JSON.stringify(latestReport, null, 2)], {
+                type: "application/json"
+            });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = `security-report-${currentJobId}.json`;
+            link.click();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            jobStatusText.textContent = `Error: ${err.message}`;
+        }
     });
 
     async function handleUpload(file) {
@@ -102,6 +130,13 @@ document.addEventListener("DOMContentLoaded", () => {
                 const res = await fetch(`/api/jobs/${jobId}`);
                 if (!res.ok) return;
                 const job = await res.json();
+                if (job.model_status === "unavailable") {
+                    jobStatusText.textContent = "Local model unavailable; detector-only analysis.";
+                } else if (job.model_status === "degraded") {
+                    jobStatusText.textContent = "Some model chunks failed; report will show coverage gaps.";
+                } else {
+                    jobStatusText.textContent = `Processing (${job.model_status} model status)...`;
+                }
 
                 // Update progress metrics
                 const completed = job.completed_chunks;
@@ -146,6 +181,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function renderReport(report) {
+        latestReport = report;
         progressView.classList.add("hidden");
         reportView.classList.remove("hidden");
 
@@ -160,6 +196,27 @@ document.addEventListener("DOMContentLoaded", () => {
         document.getElementById("count-low").textContent = report.summary.counts_by_severity.low || 0;
 
         document.getElementById("exec-summary-text").textContent = report.summary.executive_summary;
+
+        const coverage = report.coverage;
+        const modelText = report.source.model_status === "unavailable"
+            ? "Local model unavailable: only deterministic detectors ran."
+            : report.source.model_status === "degraded"
+                ? `Local model ${report.source.model || ""} had failed chunks.`
+                : `Local model: ${report.source.model || "not reported"} (${report.source.model_status}).`;
+        document.getElementById("model-availability").textContent = modelText;
+        document.getElementById("coverage-failed-ranges").textContent =
+            `Failed or unfinished ranges: ${coverage.failed_ranges.length
+                ? coverage.failed_ranges.map(range =>
+                    `${range.start_line}-${range.end_line} (${range.status})`).join(", ")
+                : "none"}`;
+        document.getElementById("coverage-truncated-lines").textContent =
+            `Truncated source lines: ${coverage.truncated_lines.length
+                ? coverage.truncated_lines.join(", ")
+                : "none"}`;
+        document.getElementById("coverage-rejected-findings").textContent =
+            `Rejected model findings: ${coverage.rejected_model_findings}`;
+
+        renderIncidents(report.incidents || []);
 
         // Findings table (Using textContent strictly for XSS protection)
         const tbody = document.getElementById("findings-tbody");
@@ -184,7 +241,10 @@ document.addEventListener("DOMContentLoaded", () => {
             tr.appendChild(tdId);
 
             const tdLines = document.createElement("td");
-            tdLines.textContent = f.evidence_lines.join(", ");
+            (f.evidence_lines || []).forEach((lineNo, index) => {
+                if (index) tdLines.appendChild(document.createTextNode(", "));
+                tdLines.appendChild(createEvidenceButton(lineNo));
+            });
             tr.appendChild(tdLines);
 
             const tdReason = document.createElement("td");
@@ -193,5 +253,64 @@ document.addEventListener("DOMContentLoaded", () => {
 
             tbody.appendChild(tr);
         });
+    }
+
+    function renderIncidents(incidents) {
+        const container = document.getElementById("incidents-container");
+        const list = document.getElementById("incidents-list");
+        list.replaceChildren();
+        container.classList.toggle("hidden", incidents.length === 0);
+
+        incidents.forEach(incident => {
+            const card = document.createElement("article");
+            card.className = "incident-card";
+            const title = document.createElement("h4");
+            title.textContent = incident.title;
+            card.appendChild(title);
+
+            const summary = document.createElement("p");
+            summary.textContent = `${incident.severity} · ${incident.identifier}`;
+            card.appendChild(summary);
+
+            const timeline = document.createElement("ul");
+            timeline.className = "incident-timeline";
+            (incident.timeline || []).forEach(item => {
+                const row = document.createElement("li");
+                row.appendChild(createEvidenceButton(item.line));
+                row.appendChild(document.createTextNode(` — ${item.event}`));
+                timeline.appendChild(row);
+            });
+            card.appendChild(timeline);
+            list.appendChild(card);
+        });
+    }
+
+    function createEvidenceButton(lineNo) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "evidence-line-btn";
+        button.textContent = `L${lineNo}`;
+        button.addEventListener("click", () => inspectRawLine(lineNo));
+        return button;
+    }
+
+    async function inspectRawLine(lineNo) {
+        if (inspectedLines.has(lineNo)) return;
+        try {
+            const response = await fetch(`/api/jobs/${currentJobId}/lines/${lineNo}`);
+            if (!response.ok) throw new Error(`Could not load line ${lineNo}.`);
+            const line = await response.json();
+            const item = document.createElement("div");
+            item.className = "raw-line-item";
+            const content = document.createElement("pre");
+            content.textContent = `L${line.line_no}: ${line.raw}`;
+            item.appendChild(content);
+            rawLineViewer.appendChild(item);
+            inspectedLines.add(lineNo);
+        } catch (err) {
+            const message = document.createElement("p");
+            message.textContent = err.message;
+            rawLineViewer.appendChild(message);
+        }
     }
 });

@@ -16,6 +16,8 @@ def parse_log_line(raw_line: str, line_no: int) -> Tuple[int, str, Dict[str, Any
     except json.JSONDecodeError:
         # Fallback for plain text lines
         return line_no, cleaned_line, {"is_json": False, "raw": cleaned_line}
+    if not isinstance(data, dict):
+        return line_no, cleaned_line, {"is_json": False, "raw": cleaned_line}
 
     # Extract and compact essential fields to cut roughly 50% of tokens
     time_full = data.get("time", "")

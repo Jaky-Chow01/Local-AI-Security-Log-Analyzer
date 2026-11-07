@@ -1,4 +1,5 @@
 import uuid
+import re
 from typing import List, Dict, Any, Callable
 from app.parse import parse_log_line
 
@@ -11,6 +12,9 @@ def chunk_log_file(
     Reads a log file, parses and compacts lines, deduplicates consecutive identical lines,
     and packs them into token-budgeted chunks with a 2-line context overlap.
     """
+    if max_tokens_per_chunk < 1:
+        raise ValueError("max_tokens_per_chunk must be greater than zero")
+
     raw_entries = []
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         for idx, line in enumerate(f, start=1):
@@ -19,7 +23,8 @@ def chunk_log_file(
                 "line_no": line_no,
                 "compacted": compacted,
                 "raw": meta["raw"],
-                "is_json": meta["is_json"]
+                "is_json": meta["is_json"],
+                "truncated": False,
             })
 
     if not raw_entries:
@@ -32,15 +37,19 @@ def chunk_log_file(
         current = raw_entries[i]
         count = 1
         end_line_no = current["line_no"]
+        repeated_line_numbers = [current["line_no"]]
+        current_without_line_number = re.sub(r"^L\d+\|", "", current["compacted"])
         while (i + count < len(raw_entries) and 
-               raw_entries[i + count]["compacted"] == current["compacted"] and
+               re.sub(r"^L\d+\|", "", raw_entries[i + count]["compacted"]) == current_without_line_number and
                raw_entries[i + count]["is_json"] == current["is_json"]):
             end_line_no = raw_entries[i + count]["line_no"]
+            repeated_line_numbers.append(end_line_no)
             count += 1
         
         entry_copy = current.copy()
         if count > 1:
             entry_copy["compacted"] = f"{current['line_no']}-{end_line_no} x{count}|{current['compacted']}"
+            entry_copy["repeat_line_numbers"] = repeated_line_numbers
         
         deduped_entries.append(entry_copy)
         i += count
@@ -50,8 +59,27 @@ def chunk_log_file(
         try:
             return len(tokenize_fn(text))
         except Exception:
-            # Fallback estimation if model/tokenizer isn't initialized yet
-            return max(1, len(text) // 4)
+            return max(1, len(text.encode("utf-8")))
+
+    def truncate_line(text: str) -> str:
+        marker = "...[truncated]..."
+        low, high = 0, len(text)
+        best = marker
+        while low <= high:
+            kept = (low + high) // 2
+            left = (kept + 1) // 2
+            right = kept // 2
+            candidate = text[:left] + marker + (text[-right:] if right else "")
+            if count_tokens(candidate) <= max_tokens_per_chunk:
+                best = candidate
+                low = kept + 1
+            else:
+                high = kept - 1
+        if count_tokens(best) > max_tokens_per_chunk:
+            best = text[:max_tokens_per_chunk]
+            while best and count_tokens(best) > max_tokens_per_chunk:
+                best = best[:-1]
+        return best
 
     # 2. Greedy pack into token-budget chunks with 2-line overlap
     chunks = []
@@ -59,33 +87,42 @@ def chunk_log_file(
     current_tokens = 0
     chunk_start_line = deduped_entries[0]["line_no"]
 
+    def get_end_line(entry: Dict[str, Any]) -> int:
+        return entry.get("repeat_line_numbers", [entry["line_no"]])[-1]
+
     for entry in deduped_entries:
         line_text = entry["compacted"]
         line_tokens = count_tokens(line_text)
 
         # Handle oversized single lines exceeding budget
         if line_tokens > max_tokens_per_chunk:
-            excess = line_tokens - max_tokens_per_chunk
-            chars_to_cut = excess * 4
-            if len(line_text) > chars_to_cut + 20:
-                mid = len(line_text) // 2
-                line_text = line_text[:mid - chars_to_cut//2] + "…[truncated]…" + line_text[mid + chars_to_cut//2:]
-                entry["compacted"] = line_text
-                line_tokens = count_tokens(line_text)
+            line_text = truncate_line(line_text)
+            entry["compacted"] = line_text
+            entry["truncated"] = True
+            line_tokens = count_tokens(line_text)
 
         if current_tokens + line_tokens > max_tokens_per_chunk and current_chunk_lines:
             # Commit current chunk
             chunks.append({
                 "chunk_id": str(uuid.uuid4()),
                 "start_line": chunk_start_line,
-                "end_line": current_chunk_lines[-1]["line_no"],
+                "end_line": get_end_line(current_chunk_lines[-1]),
                 "token_count": current_tokens,
                 "lines": current_chunk_lines,
-                "truncated": False
+                "truncated": any(line.get("truncated", False) for line in current_chunk_lines)
             })
             # Carry over last 2 lines as context overlap
             overlap = current_chunk_lines[-2:] if len(current_chunk_lines) >= 2 else current_chunk_lines
-            current_chunk_lines = [dict(l, compacted=f"(context) {l['compacted']}") for l in overlap]
+            context_lines = [
+                dict(l, compacted=f"(context) {l['compacted']}")
+                for l in overlap
+            ]
+            while context_lines and (
+                sum(count_tokens(l["compacted"]) for l in context_lines) + line_tokens
+                > max_tokens_per_chunk
+            ):
+                context_lines.pop(0)
+            current_chunk_lines = context_lines
             current_tokens = sum(count_tokens(l["compacted"]) for l in current_chunk_lines)
             chunk_start_line = current_chunk_lines[0]["line_no"] if current_chunk_lines else entry["line_no"]
 
@@ -97,10 +134,10 @@ def chunk_log_file(
         chunks.append({
             "chunk_id": str(uuid.uuid4()),
             "start_line": chunk_start_line,
-            "end_line": current_chunk_lines[-1]["line_no"],
+            "end_line": get_end_line(current_chunk_lines[-1]),
             "token_count": current_tokens,
             "lines": current_chunk_lines,
-            "truncated": False
+            "truncated": any(line.get("truncated", False) for line in current_chunk_lines)
         })
 
     return chunks

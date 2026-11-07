@@ -25,6 +25,9 @@ def init_db() -> None:
                 total_lines INTEGER DEFAULT 0,
                 total_chunks INTEGER DEFAULT 0,
                 completed_chunks INTEGER DEFAULT 0,
+                model_status TEXT NOT NULL DEFAULT 'pending',
+                model_name TEXT,
+                rejected_model_findings INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -65,17 +68,37 @@ def init_db() -> None:
                 FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
             );
         """)
+
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(jobs);").fetchall()
+        }
+        for column, declaration in (
+            ("model_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("model_name", "TEXT"),
+            ("rejected_model_findings", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration};")
         
         # Crash recovery: on boot, reset any running jobs/chunks to pending or failed
         conn.execute("""
             UPDATE jobs 
-            SET status = 'partial', updated_at = CURRENT_TIMESTAMP 
+            SET status = 'partial', model_status = 'interrupted',
+                updated_at = CURRENT_TIMESTAMP
             WHERE status = 'running';
         """)
         conn.execute("""
             UPDATE chunks 
             SET status = 'pending' 
             WHERE status = 'running';
+        """)
+        conn.execute("""
+            UPDATE jobs
+            SET completed_chunks = (
+                SELECT COUNT(*) FROM chunks
+                WHERE chunks.job_id = jobs.job_id
+                  AND chunks.status IN ('done', 'failed')
+            );
         """)
         conn.commit()
 
@@ -117,5 +140,22 @@ def get_job_status(job_id: str) -> Optional[Dict[str, Any]]:
             "total_lines": row["total_lines"],
             "total_chunks": row["total_chunks"],
             "completed_chunks": row["completed_chunks"],
+            "model_status": row["model_status"],
+            "model_name": row["model_name"],
             "chunks": [dict(c) for c in chunks]
         }
+
+
+def get_job_line(job_id: str, line_no: int) -> Optional[Dict[str, Any]]:
+    """Returns the original log line stored in a job's chunk data."""
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT compacted_data FROM chunks WHERE job_id = ? ORDER BY chunk_index;",
+            (job_id,),
+        ).fetchall()
+    for row in rows:
+        for entry in json.loads(row["compacted_data"]):
+            line_numbers = entry.get("repeat_line_numbers", [entry["line_no"]])
+            if line_no in line_numbers:
+                return {"line_no": line_no, "raw": entry["raw"]}
+    return None

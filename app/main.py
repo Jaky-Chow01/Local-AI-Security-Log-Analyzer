@@ -1,31 +1,31 @@
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 import uuid
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.db import init_db, save_job_record, get_job_status
+from app.db import get_job_line, get_job_status, init_db, save_job_record
 from app.validate import validate_upload_file, ValidationError
 from app.chunker import chunk_log_file
 from app.llm import get_tokenizer_fn
 from app.queue import JobQueueManager
 from app.report import generate_json_report
 
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncGenerator[None, None]:
+    init_db()
+    JobQueueManager.get_instance()
+    yield
+
+
 app = FastAPI(
     title="Local AI Security Log Analyzer",
     description="Offline Hybrid Deterministic-LLM SIEM Log Analyzer",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
-
-# Initialize database and schema on startup
-from fastapi import FastAPI
-from app.db import init_db
-
-app = FastAPI(title="Local AI Security Log Analyzer")
-
-@app.on_event("startup")
-def startup_event():
-    init_db()
 
 # Mount static frontend directory
 STATIC_DIR = Path("static")
@@ -67,7 +67,8 @@ async def upload_log_file(file: UploadFile = File(...)):
         chunks = chunk_log_file(str(file_path), tokenizer_fn, max_tokens_per_chunk=1000)
 
         # Count total lines across chunks
-        total_lines = sum(len(json_lines["lines"]) for json_lines in chunks)
+        with open(file_path, "r", encoding="utf-8", errors="replace") as log_file:
+            total_lines = sum(1 for _ in log_file)
 
         # Save job and chunks to SQLite
         save_job_record(job_id, file.filename, total_lines, chunks)
@@ -100,6 +101,16 @@ def get_job(job_id: str):
     if not status:
         raise HTTPException(status_code=404, detail="Job not found.")
     return status
+
+@app.get("/api/jobs/{job_id}/lines/{line_no}")
+def get_job_raw_line(job_id: str, line_no: int):
+    """Returns one original upload line for report evidence inspection."""
+    if line_no < 1:
+        raise HTTPException(status_code=422, detail="Line number must be positive.")
+    line = get_job_line(job_id, line_no)
+    if line is None:
+        raise HTTPException(status_code=404, detail="Log line not found.")
+    return line
 
 @app.post("/api/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):

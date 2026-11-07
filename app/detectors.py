@@ -9,10 +9,19 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
     Returns a list of structured finding dictionaries.
     """
     findings = []
-    
-    # State tracking for brute force & account takeover
+
     login_failures: Dict[str, List[int]] = {}  # key: ip_or_user -> list of line numbers
-    login_attempts_by_ip: Dict[str, List[int]] = {}
+    brute_force_reported = set()
+
+    expanded_entries = []
+    seen_line_numbers = set()
+    for entry in log_entries:
+        line_numbers = entry.get("repeat_line_numbers", [entry["line_no"]])
+        for line_no in line_numbers:
+            if line_no in seen_line_numbers:
+                continue
+            seen_line_numbers.add(line_no)
+            expanded_entries.append({**entry, "line_no": line_no})
     
     # Regex patterns for signatures
     sqli_patterns = [
@@ -34,7 +43,7 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
         "you are now in developer mode"
     ]
 
-    for entry in log_entries:
+    for entry in expanded_entries:
         line_no = entry["line_no"]
         raw_text = entry["raw"]
         
@@ -42,20 +51,27 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
         data = {}
         try:
             if entry["is_json"] or raw_text.startswith("{"):
-                data = json.loads(raw_text)
-        except Exception:
+                parsed_data = json.loads(raw_text)
+                if isinstance(parsed_data, dict):
+                    data = parsed_data
+        except json.JSONDecodeError:
             pass
 
-        client_ip = data.get("client_ip", "unknown")
-        path = data.get("path", "")
-        method = data.get("method", "")
+        client_ip = str(data.get("client_ip", "unknown"))
+        path = str(data.get("path", ""))
         status = str(data.get("status", ""))
-        username = data.get("username", "")
-        auth_result = data.get("auth_result", data.get("auth", ""))
-        message = data.get("message", "")
-        submitted_text = data.get("submitted_text", "")
-        response_bytes = data.get("response_bytes", 0)
-        reqs_in_win = data.get("requests_in_window", 0)
+        username = str(data.get("username", ""))
+        auth_result = str(data.get("auth_result", data.get("auth", ""))).lower()
+        message = str(data.get("message", ""))
+        submitted_text = str(data.get("submitted_text", ""))
+        try:
+            response_bytes = int(data.get("response_bytes", 0))
+        except (TypeError, ValueError):
+            response_bytes = 0
+        try:
+            reqs_in_win = int(data.get("requests_in_window", 0))
+        except (TypeError, ValueError):
+            reqs_in_win = 0
 
         # Double URL decode for robust inspection
         decoded_path = unquote(unquote(path))
@@ -107,7 +123,7 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
 
         # 4. Recon / Scanning Detector
         recon_paths = ["/wp-admin", "/phpmyadmin", "/wp-login.php", "/env", "/config.json"]
-        if any(rp in path.lower() for rp in recon_paths) or (status == "404" and ("/admin" in path or "/api" in path)):
+        if any(rp in path.lower() for rp in recon_paths):
             findings.append({
                 "id": f"DET-RECON-{line_no}",
                 "attack_type": "recon_scanning",
@@ -120,12 +136,24 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
             })
 
         # 5. Brute Force & Account Takeover tracking
-        if "/auth/login" in path:
+        if "/auth/login" in path.lower():
             key = f"{client_ip}:{username or 'unknown'}"
-            if auth_result in ["fail", "failure", "401"] or status in ["401", "403"]:
+            if auth_result in {"fail", "failure", "invalid_password", "401"} or status in {"401", "403"}:
                 login_failures.setdefault(key, []).append(line_no)
-            elif auth_result in ["success", "200"] and status == "200":
-                # Check if preceded by multiple failures (Account Takeover indicator)
+                failures = login_failures[key]
+                if len(failures) >= 5 and key not in brute_force_reported:
+                    brute_force_reported.add(key)
+                    findings.append({
+                        "id": f"DET-BF-{line_no}",
+                        "attack_type": "brute_force",
+                        "severity": "high",
+                        "identifier": client_ip,
+                        "evidence_lines": failures.copy(),
+                        "reasoning": f"Brute-force activity detected from IP {client_ip} after {len(failures)} failed login attempts for user '{username}'.",
+                        "suggested_actions": ["Apply account lockout or MFA challenges", "Rate-limit or block the source IP"],
+                        "source": "detector"
+                    })
+            elif status.startswith("2") or auth_result in {"success", "200"}:
                 failures = login_failures.get(key, [])
                 if len(failures) >= 3:
                     findings.append({
@@ -138,19 +166,28 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
                         "suggested_actions": ["Revoke active session tokens", "Force password reset for user", "Block IP"],
                         "source": "detector"
                     })
-                elif len(failures) >= 5:
-                    findings.append({
-                        "id": f"DET-BF-{line_no}",
-                        "attack_type": "brute_force",
-                        "severity": "high",
-                        "identifier": client_ip,
-                        "evidence_lines": failures,
-                        "reasoning": f"Brute force credential stuffing detected from IP {client_ip} ({len(failures)} failed attempts).",
-                        "suggested_actions": ["Implement temporary account lockout or CAPTCHA", "Block IP"],
-                        "source": "detector"
-                    })
 
-        # 6. Data Exfiltration Detector
+        # 6. Unauthorized access detector for protected endpoints outside login flows.
+        if (
+            "/auth/login" not in path.lower()
+            and path
+            and (
+                status in {"401", "403"}
+                or auth_result in {"unauthorized", "denied", "forbidden", "access_denied"}
+            )
+        ):
+            findings.append({
+                "id": f"DET-UNAUTH-{line_no}",
+                "attack_type": "unauthorized_access",
+                "severity": "high" if status == "403" else "medium",
+                "identifier": client_ip,
+                "evidence_lines": [line_no],
+                "reasoning": f"Access to {path} was rejected as unauthorized (HTTP {status or 'unknown'}).",
+                "suggested_actions": ["Review access-control rules and authentication logs", "Verify whether the denied request was expected"],
+                "source": "detector"
+            })
+
+        # 7. Data Exfiltration Detector
         if response_bytes > 2000000 and ("export" in path or "csv" in path or "download" in path):
             findings.append({
                 "id": f"DET-EXFIL-{line_no}",
@@ -163,7 +200,7 @@ def run_deterministic_detectors(log_entries: List[Dict[str, Any]]) -> List[Dict[
                 "source": "detector"
             })
 
-        # 7. Rate Abuse / DoS Detector
+        # 8. Rate Abuse / DoS Detector
         if reqs_in_win > 50 or status == "429":
             findings.append({
                 "id": f"DET-RATE-{line_no}",

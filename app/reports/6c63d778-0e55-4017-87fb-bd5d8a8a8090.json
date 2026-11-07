@@ -1,0 +1,185 @@
+{
+  "report_version": "1.0",
+  "job_id": "6c63d778-0e55-4017-87fb-bd5d8a8a8090",
+  "generated_at": "2026-11-07T10:16:38.831483+00:00",
+  "source": {
+    "filename": "Cultive8_Workspace_Agrigen_Server.log",
+    "total_lines": 258,
+    "chunks": 21,
+    "model": null,
+    "model_status": "unavailable"
+  },
+  "status": "partial",
+  "summary": {
+    "overall_risk": "high",
+    "counts_by_severity": {
+      "critical": 0,
+      "high": 2,
+      "medium": 0,
+      "low": 0
+    },
+    "executive_summary": "Analyzed 258 lines across 21 chunks. Identified 2 distinct security findings and 0 multi-stage incident chains. Overall assessed risk level is HIGH."
+  },
+  "incidents": [],
+  "findings": [
+    {
+      "id": "DET-BF-50",
+      "attack_type": "brute_force",
+      "severity": "high",
+      "identifier": "203.0.113.44",
+      "evidence_lines": [
+        5,
+        13,
+        23,
+        35,
+        50
+      ],
+      "reasoning": "Brute-force activity detected from IP 203.0.113.44 after 5 failed login attempts for user 'workspace.admin'.",
+      "suggested_actions": [
+        "Rate-limit or block the source IP",
+        "Apply account lockout or MFA challenges"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    },
+    {
+      "id": "DET-UNAUTH-54",
+      "attack_type": "unauthorized_access",
+      "severity": "high",
+      "identifier": "203.0.113.90",
+      "evidence_lines": [
+        54,
+        56,
+        99,
+        101,
+        102
+      ],
+      "reasoning": "Access to /.env was rejected as unauthorized (HTTP 403).",
+      "suggested_actions": [
+        "Review access-control rules and authentication logs",
+        "Verify whether the denied request was expected"
+      ],
+      "confidence": 1.0,
+      "source": "detector"
+    }
+  ],
+  "coverage": {
+    "failed_ranges": [
+      {
+        "start_line": 1,
+        "end_line": 16,
+        "status": "failed"
+      },
+      {
+        "start_line": 15,
+        "end_line": 29,
+        "status": "failed"
+      },
+      {
+        "start_line": 28,
+        "end_line": 39,
+        "status": "failed"
+      },
+      {
+        "start_line": 38,
+        "end_line": 53,
+        "status": "failed"
+      },
+      {
+        "start_line": 52,
+        "end_line": 67,
+        "status": "failed"
+      },
+      {
+        "start_line": 66,
+        "end_line": 80,
+        "status": "failed"
+      },
+      {
+        "start_line": 79,
+        "end_line": 93,
+        "status": "failed"
+      },
+      {
+        "start_line": 92,
+        "end_line": 105,
+        "status": "failed"
+      },
+      {
+        "start_line": 104,
+        "end_line": 118,
+        "status": "failed"
+      },
+      {
+        "start_line": 117,
+        "end_line": 131,
+        "status": "failed"
+      },
+      {
+        "start_line": 130,
+        "end_line": 144,
+        "status": "failed"
+      },
+      {
+        "start_line": 143,
+        "end_line": 158,
+        "status": "failed"
+      },
+      {
+        "start_line": 157,
+        "end_line": 168,
+        "status": "failed"
+      },
+      {
+        "start_line": 167,
+        "end_line": 180,
+        "status": "failed"
+      },
+      {
+        "start_line": 179,
+        "end_line": 193,
+        "status": "failed"
+      },
+      {
+        "start_line": 192,
+        "end_line": 205,
+        "status": "failed"
+      },
+      {
+        "start_line": 204,
+        "end_line": 217,
+        "status": "failed"
+      },
+      {
+        "start_line": 216,
+        "end_line": 230,
+        "status": "failed"
+      },
+      {
+        "start_line": 229,
+        "end_line": 243,
+        "status": "failed"
+      },
+      {
+        "start_line": 242,
+        "end_line": 257,
+        "status": "failed"
+      },
+      {
+        "start_line": 256,
+        "end_line": 258,
+        "status": "failed"
+      }
+    ],
+    "truncated_lines": [],
+    "rejected_model_findings": 0,
+    "rejected_report_findings": 0,
+    "rejected_chunk_data": 0
+  },
+  "limitations": [
+    "Analysis runs locally and is subject to the configured model context and CPU limits.",
+    "Deterministic detector thresholds are heuristics and require analyst review.",
+    "The local model was unavailable; this report contains deterministic detector results only.",
+    "Failed or unfinished chunks are listed in coverage.failed_ranges."
+  ]
+}

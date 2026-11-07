@@ -50,7 +50,10 @@
         <section id="report-view" class="card hidden">
             <div class="report-header">
                 <h2>Analysis Forensic Report</h2>
-                <button id="new-analysis-btn" class="btn btn-secondary">Analyze Another Log</button>
+                <div class="report-actions">
+                    <button id="download-report-btn" class="btn btn-secondary">Download JSON</button>
+                    <button id="new-analysis-btn" class="btn btn-secondary">Analyze Another Log</button>
+                </div>
             </div>
             
             <div class="summary-cards">
@@ -81,6 +84,14 @@
                 <p id="exec-summary-text">-</p>
             </div>
 
+            <section id="coverage-panel" class="coverage-panel">
+                <h3>Analysis Coverage</h3>
+                <p id="model-availability"></p>
+                <p id="coverage-failed-ranges"></p>
+                <p id="coverage-truncated-lines"></p>
+                <p id="coverage-rejected-findings"></p>
+            </section>
+
             <div id="incidents-container" class="hidden">
                 <h3>Correlated Incident Chains</h3>
                 <div id="incidents-list"></div>
@@ -101,6 +112,11 @@
                     <tbody id="findings-tbody"></tbody>
                 </table>
             </div>
+            <section class="raw-lines-section">
+                <h3>Raw Log Evidence</h3>
+                <p>Select an evidence line to inspect the original uploaded text.</p>
+                <div id="raw-line-viewer" aria-live="polite"></div>
+            </section>
         </section>
     </div>
 
