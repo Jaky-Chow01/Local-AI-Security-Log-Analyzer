@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';">
+    <title>Local AI Security Log Analyzer</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🔒 Local AI Security Log Analyzer</h1>
+            <p>Offline Hybrid Deterministic-LLM SIEM & Forensic Forensics Workbench</p>
+        </header>
+
+        <!-- Upload View -->
+        <section id="upload-view" class="card">
+            <h2>Upload Server Log File</h2>
+            <p class="subtitle">Drop an Apache, Nginx, or structured JSON log file (.log or .txt, max 2 MB) below.</p>
+            <div id="drop-zone" class="drop-zone">
+                <p>Drag & drop your log file here or click to browse</p>
+                <input type="file" id="file-input" accept=".log,.txt" hidden>
+            </div>
+            <div id="upload-error" class="error-banner hidden"></div>
+        </section>
+
+        <!-- Progress View -->
+        <section id="progress-view" class="card hidden">
+            <h2>Analyzing Log File</h2>
+            <div class="progress-info">
+                <span id="job-filename">filename.log</span>
+                <span id="job-status-text">Processing chunks...</span>
+            </div>
+            <div class="progress-bar-container">
+                <div id="progress-bar" class="progress-bar"></div>
+            </div>
+            <div class="chunk-metrics">
+                <span>Completed Chunks: <strong id="completed-chunks-count">0</strong> / <span id="total-chunks-count">0</span></span>
+                <span id="elapsed-time">Elapsed: 0s</span>
+            </div>
+            <h3>Chunk Processing Grid</h3>
+            <div id="chunk-grid" class="chunk-grid"></div>
+            <div class="actions">
+                <button id="cancel-btn" class="btn btn-danger">Cancel Analysis</button>
+            </div>
+        </section>
+
+        <!-- Report View -->
+        <section id="report-view" class="card hidden">
+            <div class="report-header">
+                <h2>Analysis Forensic Report</h2>
+                <button id="new-analysis-btn" class="btn btn-secondary">Analyze Another Log</button>
+            </div>
+            
+            <div class="summary-cards">
+                <div class="metric-card" id="card-risk">
+                    <span class="metric-label">Overall Risk</span>
+                    <span id="metric-overall-risk" class="metric-value">-</span>
+                </div>
+                <div class="metric-card critical">
+                    <span class="metric-label">Critical</span>
+                    <span id="count-critical" class="metric-value">0</span>
+                </div>
+                <div class="metric-card high">
+                    <span class="metric-label">High</span>
+                    <span id="count-high" class="metric-value">0</span>
+                </div>
+                <div class="metric-card medium">
+                    <span class="metric-label">Medium</span>
+                    <span id="count-medium" class="metric-value">0</span>
+                </div>
+                <div class="metric-card low">
+                    <span class="metric-label">Low</span>
+                    <span id="count-low" class="metric-value">0</span>
+                </div>
+            </div>
+
+            <div class="executive-summary-box">
+                <h3>Executive Summary</h3>
+                <p id="exec-summary-text">-</p>
+            </div>
+
+            <div id="incidents-container" class="hidden">
+                <h3>Correlated Incident Chains</h3>
+                <div id="incidents-list"></div>
+            </div>
+
+            <h3>Security Findings</h3>
+            <div class="table-responsive">
+                <table id="findings-table">
+                    <thead>
+                        <tr>
+                            <th>Severity</th>
+                            <th>Attack Type</th>
+                            <th>Identifier</th>
+                            <th>Evidence Lines</th>
+                            <th>Reasoning / Source</th>
+                        </tr>
+                    </thead>
+                    <tbody id="findings-tbody"></tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
